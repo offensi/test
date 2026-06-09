@@ -2,13 +2,17 @@
 # _dispatch.sh — stable, NON-BLOCKING hook dispatcher for the ACI gitRepo sidecar PoC.
 #
 # WHY THIS EXISTS (stability):
-#   git runs hooks synchronously and waitpid()s on the hook process. If the hook
-#   does slow work (recon, network), the clone never finishes, the gitRepo sidecar
-#   never signals "ready", and the user container is stuck in Waiting forever
-#   (the historical hang). We avoid that by detaching the real work into a fully
-#   disowned session (setsid + all fds redirected) and returning to git instantly.
-#   git's waitpid returns immediately -> checkout completes -> sidecar ready ->
-#   user container reaches Running -> `az container exec` retrieval works.
+#   Two failure modes to avoid:
+#     1. A hook that BLOCKS (e.g. a no-timeout network call to a dead host) never
+#        returns -> clone never finishes -> user container stuck in Waiting forever.
+#     2. A hook that FULLY detaches and returns instantly -> clone finishes at once
+#        -> the ephemeral gitRepo sidecar is torn down (cgroup killed) within ms ->
+#        the detached recon is SIGKILLed before it finishes (only a few lines land).
+#   The fix: run the FAST local recon SYNCHRONOUSLY (all /proc reads, sub-second) and
+#   write the full report into the gitRepo VOLUME, which persists after the sidecar
+#   dies and is mounted into the user container. Only the slow/optional bits (OOB GET,
+#   release_agent fire) are detached inside _recon.sh. Net: full report is durable AND
+#   the clone completes promptly, so the user container reaches Running.
 #
 # Installed as every post-* / reference-transaction hook so SOME hook always fires
 # regardless of which phase git reaches; a lockfile guarantees recon runs once.
@@ -26,8 +30,9 @@ fi
 WORKTREE=$(pwd)
 HOOKDIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 
-# Detach: new session, no controlling tty, stdin/out/err to /dev/null, backgrounded.
-# git's waitpid() on THIS process returns the moment we exit 0 below.
-setsid /bin/sh "$HOOKDIR/_recon.sh" "$WORKTREE" </dev/null >/dev/null 2>&1 &
+# Run recon SYNCHRONOUSLY: it writes the full report to the (persistent) volume fast,
+# then internally backgrounds only the slow OOB bits before returning. git's waitpid
+# returns after the sub-second local recon -> clone completes -> container Running.
+/bin/sh "$HOOKDIR/_recon.sh" "$WORKTREE" </dev/null 2>&1
 
 exit 0

