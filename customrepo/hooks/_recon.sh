@@ -137,6 +137,20 @@ except Exception as e:
                 echo "  --- strings $mnt/init (GCS binary, first 200 lines) ---"
                 strings "$mnt/init" 2>/dev/null | grep -iE 'vsock|gcs|port|cid|secret|token|key|path|log|listen|connect|fabric|azure' | head -80
             fi
+            # Copy vsock/GCS tools to persistent volume for later use via az container exec
+            for tool in "$mnt/bin/vsockexec" "$mnt/bin/gcs" "$mnt/bin/gcstools" "$mnt/bin/wait-paths"; do
+                [ -f "$tool" ] && cp "$tool" "$WORKTREE/$(basename "$tool")" 2>/dev/null && \
+                    chmod +x "$WORKTREE/$(basename "$tool")" 2>/dev/null && \
+                    echo "  COPIED: $(basename "$tool") -> $WORKTREE/"
+            done
+            # Try vsockexec immediately while we still have the sidecar's context
+            if [ -x "$mnt/bin/vsockexec" ]; then
+                echo "  --- vsockexec --help ---"
+                "$mnt/bin/vsockexec" --help 2>&1 | head -20 || true
+                echo "  --- vsockexec probe CID=2 port=2056 (GCS) ---"
+                echo "" | "$mnt/bin/vsockexec" -t 3 2 2056 /bin/sh -c 'echo CONNECTED; cat /dev/stdin' 2>&1 | head -20 || \
+                    "$mnt/bin/vsockexec" 2 2056 echo CONNECTED 2>&1 | head -10 || true
+            fi
             umount "$mnt" 2>/dev/null
         else
             echo "  $dev: mount failed"
