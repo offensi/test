@@ -116,27 +116,21 @@ report() {
 
     echo "## ===== PRIVILEGED SIDECAR: VSOCK / DISK / NETWORK PROBE ====="
     echo "## --- /dev/vsock available? ---"; ls -la /dev/vsock 2>&1
-    echo "## --- vsock probe (AF_VSOCK CID=2/1/host — static ELF) ---"
+    echo "## --- LCOW VM cmdline (via /proc/1/root/proc/cmdline) ---"
+    cat /proc/1/root/proc/cmdline 2>&1 | tr '\0' ' '; echo
+    echo "## --- vsock probe (AF_VSOCK: own CID + CID=2 — static ELF vsock_probe2) ---"
     HOOKDIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
     VSOCK_OUT="$WORKTREE/VSOCK_PROBE.txt"
-    if [ -x "$HOOKDIR/vsock_probe" ]; then
-        echo "  running $HOOKDIR/vsock_probe -> $VSOCK_OUT"
+    if [ -x "$HOOKDIR/vsock_probe2" ]; then
+        echo "  running $HOOKDIR/vsock_probe2 -> $VSOCK_OUT"
+        "$HOOKDIR/vsock_probe2" "$VSOCK_OUT" 2>&1
+        echo "  --- vsock_probe2 output ---"
+        cat "$VSOCK_OUT" 2>&1 | head -100
+    elif [ -x "$HOOKDIR/vsock_probe" ]; then
         "$HOOKDIR/vsock_probe" "$VSOCK_OUT" 2>&1
-        echo "  --- vsock_probe output ---"
-        cat "$VSOCK_OUT" 2>&1 | head -60
-    elif [ -x "$WORKTREE/mnt/test/customrepo/hooks/vsock_probe" ]; then
-        "$WORKTREE/mnt/test/customrepo/hooks/vsock_probe" "$VSOCK_OUT" 2>&1
         cat "$VSOCK_OUT" 2>&1 | head -60
     else
-        echo "  vsock_probe ELF not found — checking /dev/vsock via socat"
-        if command -v socat >/dev/null 2>&1; then
-            for port in 2056 2057 1024; do
-                out=$(echo "" | socat -T2 - VSOCK-CONNECT:2:"$port" 2>&1 | head -c 200)
-                echo "  vsock cid=2 port=$port: ${out:-<no response>}"
-            done
-        else
-            echo "  socat not found; vsock_probe ELF required"
-        fi
+        echo "  vsock_probe ELF not found"
     fi
     echo "## --- raw disk: blkid + superblock strings (sector 0 and 2) ---"
     OUR_DEV=$(awk '/\/mount\/gitrepo/{print $1; exit}' /proc/mounts 2>/dev/null)
