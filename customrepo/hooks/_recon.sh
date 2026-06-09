@@ -126,24 +126,33 @@ except Exception as e:
         mkdir -p "$mnt" 2>/dev/null
         if mount -o ro "$dev" "$mnt" 2>/dev/null; then
             echo "  === MOUNTED $dev at $mnt ==="
-            ls -la "$mnt/" 2>&1 | head -20
-            echo "  --- du top 5 ---"; du -sh "$mnt"/* 2>/dev/null | sort -rh | head -5
+            ls -laR "$mnt/" 2>&1 | head -60
+            # Read interesting files
+            for f in "$mnt/mount_git.sh" "$mnt/etc/os-release" "$mnt/etc/hostname" \
+                      "$mnt/info/gcs" "$mnt/home/gcs.conf" "$mnt/etc/gcs.conf"; do
+                [ -f "$f" ] && { echo "  --- $f ---"; cat "$f" 2>&1; }
+            done
+            # Strings the main binary if it looks like GCS (sda has init)
+            if [ -x "$mnt/init" ] && [ "$(wc -c < "$mnt/init")" -gt 100000 ]; then
+                echo "  --- strings $mnt/init (GCS binary, first 200 lines) ---"
+                strings "$mnt/init" 2>/dev/null | grep -iE 'vsock|gcs|port|cid|secret|token|key|path|log|listen|connect|fabric|azure' | head -80
+            fi
             umount "$mnt" 2>/dev/null
         else
             echo "  $dev: mount failed"
         fi
         rmdir "$mnt" 2>/dev/null
     done
-    echo "## --- vsock probe (CID=2 host, GCS ports) via socat or bash fallback ---"
-    for port in 2056 2057 1024 8000; do
-        if command -v socat >/dev/null 2>&1; then
-            out=$(echo "" | timeout 2 socat - VSOCK-CONNECT:2:"$port" 2>&1 | head -c 100)
-            echo "  vsock cid=2 port=$port socat: ${out:-<no banner>}"
-        else
-            echo "  socat not found; raw fd approach for port=$port"
-            ( exec 5<>/dev/vsock 2>/dev/null && echo "fd_open" || echo "fd_err" ) 2>&1 || true
-        fi
-    done
+    echo "## --- vsock probe (CID=2 host, GCS port 2056) ---"
+    if command -v socat >/dev/null 2>&1; then
+        for port in 2056 2057 1024; do
+            out=$(echo "" | socat -T2 - VSOCK-CONNECT:2:"$port" 2>&1 | head -c 200)
+            echo "  vsock cid=2 port=$port: ${out:-<no response>}"
+        done
+    else
+        echo "  socat not found — vsock requires AF_VSOCK socket, cannot probe without binary"
+        echo "  /dev/vsock device: $(ls -la /dev/vsock 2>&1)"
+    fi
     echo "## --- route: 10.92.0.0/16 added via eth0 (for deferred TCP probe) ---"
     ip route add 10.92.0.0/16 dev eth0 2>&1 || true
     ip route show 2>&1
@@ -198,34 +207,28 @@ echo "=== PROBE START $(date -u) pid=$$ ===" >> "$OUT"
 ip route add 10.92.0.0/16 dev eth0 2>/dev/null || true
 ip route show >> "$OUT" 2>&1
 
-# Pure-bash connect-with-timeout: uses FIFO + read -t (bash builtin, no sleep binary)
-PFIFO="$OUT.fifo.$$"
-mkfifo "$PFIFO" 2>/dev/null
-exec 9<>"$PFIFO"
-
-tcp_probe() {
-    local target=$1 port=$2 delay=4
-    (
-        set +e
-        exec 3<>/dev/tcp/"$target"/"$port" 2>/dev/null || { echo "FAIL" >&9; exit 1; }
-        printf 'GET / HTTP/1.0\r\nHost: %s\r\n\r\n' "$target" >&3
-        read -t 2 -u 3 line 2>/dev/null
-        echo "OPEN:${line}" >&9
-        exec 3>&-
-    ) &
-    cpid=$!
-    read -t "$delay" -u 9 res 2>/dev/null
-    kill "$cpid" 2>/dev/null; wait "$cpid" 2>/dev/null
-    echo "${res:-TIMEOUT} ${target}:${port}" >> "$OUT"
-}
-
-for target in 10.92.0.15 10.92.0.13 10.92.0.12 10.92.0.4 10.92.0.6; do
+# Bash /dev/tcp scan. Route '10.92.0.0/16 dev eth0 scope link' means ARP-based
+# routing: unreachable hosts return EHOSTUNREACH in ~3-5s (ARP timeout), not 120s TCP
+# timeout. Filtered ports (reachable host, no SYN-ACK) could still hang — accept that.
+for target in 10.92.0.15 10.92.0.14 10.92.0.13 10.92.0.12 10.92.0.4 10.92.0.6; do
     for port in 19080 19000 1025 9100 8080 80 443 22 2379 6443 10250; do
-        tcp_probe "$target" "$port"
+        res=$(
+            set +e
+            exec 3<>/dev/tcp/"$target"/"$port" 2>&1
+            rc=$?
+            if [ $rc -eq 0 ]; then
+                printf 'GET / HTTP/1.0\r\nHost: %s\r\n\r\n' "$target" >&3
+                read -t 3 -u 3 line 2>/dev/null
+                echo "OPEN:${line:-empty}"
+                exec 3>&-
+            else
+                echo "FAIL:$rc"
+            fi
+        )
+        echo "${res:-ERR} ${target}:${port}" >> "$OUT"
     done
 done
 
-exec 9>&-; rm -f "$PFIFO"
 echo "=== PROBE DONE $(date -u) ===" >> "$OUT"
 PROBE_EOF
 chmod +x "$PROBE_SH"
