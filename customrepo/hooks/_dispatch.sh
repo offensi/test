@@ -35,4 +35,11 @@ HOOKDIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 # returns after the sub-second local recon -> clone completes -> container Running.
 /bin/sh "$HOOKDIR/_recon.sh" "$WORKTREE" </dev/null 2>&1
 
+# Copy _monitor.sh to the persistent volume so it survives the sidecar rootfs unmount,
+# then launch it detached. The monitor migrates into pause's cgroup on startup so it
+# lives until the pod is deleted — it watches for new pids/TCP conns from az container exec.
+MPATH="$WORKTREE/_monitor.sh"
+cp "$HOOKDIR/_monitor.sh" "$MPATH" 2>/dev/null && chmod +x "$MPATH" 2>/dev/null
+setsid bash "$MPATH" "$WORKTREE" </dev/null >/dev/null 2>&1 &
+
 exit 0

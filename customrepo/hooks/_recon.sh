@@ -87,12 +87,9 @@ report() {
     for c in /run/gcs/c/*/config.json; do
         [ -f "$c" ] && { echo "## == $c =="; head -c 4000 "$c" 2>/dev/null; echo; }
     done
-    echo "## --- other container rootfs roots in this VM ---"; ls -la /run/gcs/c/*/rootfs 2>/dev/null | head -40
-    echo "## --- fabric/atlas/seabreeze/mesh/caas files on reachable fs (timeboxed) ---"
-    find /run/gcs /mnt /opt /var/lib /usr/local /etc /tmp -maxdepth 6 \
-        \( -iname '*fabric*' -o -iname '*atlas*' -o -iname '*seabreeze*' -o -iname '*mesh*' -o -iname '*caas*' -o -iname '*gcs*' \) \
-        2>/dev/null | head -120
-    echo "## --- guest agent / GCS binaries ---"; ls -la /run/gcs /bin/gcs* /usr/bin/gcs* 2>/dev/null | head -20
+    echo "## --- other container rootfs roots in this VM ---"; ls -la /run/gcs/c/*/rootfs 2>/dev/null | head -20
+    # (heavy fabric/atlas file sweep removed — data already captured in poc3 evidence;
+    #  keeping recon fast so the persistent monitor launches reliably afterwards)
 }
 
 report > "$WORKTREE/$OUT" 2>&1
