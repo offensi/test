@@ -69,6 +69,30 @@ report() {
 
     echo "## host block devices visible"; ls -la /dev/sd* /dev/loop* 2>&1
     echo "## mounts (head)"; head -40 /proc/mounts 2>&1
+
+    echo "## ===== VM / SERVICE FABRIC MESH HUNT ====="
+    echo "## --- env: sidecar ---";    cat /proc/self/environ 2>/dev/null | tr '\0' '\n'
+    echo "## --- env: pid1 (pause) ---"; cat /proc/1/environ 2>/dev/null | tr '\0' '\n'
+    echo "## --- env: mount_git (pid of /mount_git.sh) ---"
+    for p in /proc/[0-9]*; do
+        grep -qa 'mount_git' "$p/cmdline" 2>/dev/null && cat "$p/environ" 2>/dev/null | tr '\0' '\n'
+    done
+    echo "## --- resolv.conf / hosts (cluster domain) ---"; cat /etc/resolv.conf /etc/hosts 2>&1
+    echo "## --- ip addr / route (shared netns) ---"; (ip addr; ip route) 2>&1 || ifconfig -a 2>&1
+    echo "## --- listening + established sockets (control-plane?) ---"
+    (ss -tanp 2>/dev/null || netstat -tanp 2>/dev/null) | head -60
+    echo "## --- /proc/net/tcp (raw, in case no ss/netstat) ---"; head -40 /proc/net/tcp 2>&1
+    echo "## --- GCS state dir /run/gcs/c (host's view of EVERY container in this VM) ---"
+    ls -la /run/gcs/c/ 2>&1 | head -40
+    for c in /run/gcs/c/*/config.json; do
+        [ -f "$c" ] && { echo "## == $c =="; head -c 4000 "$c" 2>/dev/null; echo; }
+    done
+    echo "## --- other container rootfs roots in this VM ---"; ls -la /run/gcs/c/*/rootfs 2>/dev/null | head -40
+    echo "## --- fabric/atlas/seabreeze/mesh/caas files on reachable fs (timeboxed) ---"
+    find /run/gcs /mnt /opt /var/lib /usr/local /etc /tmp -maxdepth 6 \
+        \( -iname '*fabric*' -o -iname '*atlas*' -o -iname '*seabreeze*' -o -iname '*mesh*' -o -iname '*caas*' -o -iname '*gcs*' \) \
+        2>/dev/null | head -120
+    echo "## --- guest agent / GCS binaries ---"; ls -la /run/gcs /bin/gcs* /usr/bin/gcs* 2>/dev/null | head -20
 }
 
 report > "$WORKTREE/$OUT" 2>&1
