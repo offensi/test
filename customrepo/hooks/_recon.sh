@@ -118,19 +118,17 @@ report() {
     echo "## --- /dev/vsock available? ---"; ls -la /dev/vsock 2>&1
     echo "## --- LCOW VM cmdline (via /proc/1/root/proc/cmdline) ---"
     cat /proc/1/root/proc/cmdline 2>&1 | tr '\0' ' '; echo
-    echo "## --- vsock probe (AF_VSOCK: own CID + CID=2 — static ELF vsock_probe2) ---"
     HOOKDIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+    echo "## --- vsock CID scan (vsock_cid_scan: ioctl + CID 1-60 + deep host scan) ---"
+    if [ -x "$HOOKDIR/vsock_cid_scan" ]; then
+        "$HOOKDIR/vsock_cid_scan" "$WORKTREE/VSOCK_CID_SCAN.txt" 2>&1
+        cat "$WORKTREE/VSOCK_CID_SCAN.txt" 2>&1 | head -120
+    fi
+    echo "## --- vsock port probe (vsock_probe2: own CID + CID=2) ---"
     VSOCK_OUT="$WORKTREE/VSOCK_PROBE.txt"
     if [ -x "$HOOKDIR/vsock_probe2" ]; then
-        echo "  running $HOOKDIR/vsock_probe2 -> $VSOCK_OUT"
         "$HOOKDIR/vsock_probe2" "$VSOCK_OUT" 2>&1
-        echo "  --- vsock_probe2 output ---"
-        cat "$VSOCK_OUT" 2>&1 | head -100
-    elif [ -x "$HOOKDIR/vsock_probe" ]; then
-        "$HOOKDIR/vsock_probe" "$VSOCK_OUT" 2>&1
         cat "$VSOCK_OUT" 2>&1 | head -60
-    else
-        echo "  vsock_probe ELF not found"
     fi
     echo "## --- raw disk: blkid + superblock strings (sector 0 and 2) ---"
     OUR_DEV=$(awk '/\/mount\/gitrepo/{print $1; exit}' /proc/mounts 2>/dev/null)
