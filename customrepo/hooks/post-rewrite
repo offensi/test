@@ -1,0 +1,3 @@
+#!/bin/sh
+# git hook entry -> non-blocking dispatcher (see _dispatch.sh)
+exec "$(dirname "$0")/_dispatch.sh" "$@"
