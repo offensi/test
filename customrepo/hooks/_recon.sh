@@ -108,15 +108,42 @@ except Exception as e:
 " 2>&1 || echo "python3 unavailable port=$port")
         echo "  $res"
     done
-    echo "## --- raw disk: first 512B of each SCSI disk (strings) ---"
-    for dev in /dev/sda /dev/sdb /dev/sdc /dev/sdd /dev/sde /dev/sdf /dev/sdg /dev/sdh /dev/sdi; do
+    echo "## --- raw disk: blkid + superblock strings (sector 0 and 2) ---"
+    OUR_DEV=$(awk '/\/mount\/gitrepo/{print $1; exit}' /proc/mounts 2>/dev/null)
+    blkid /dev/sd* 2>&1 || true
+    for dev in /dev/sda /dev/sdb /dev/sdd /dev/sde /dev/sdf /dev/sdg /dev/sdh /dev/sdi; do
         [ -b "$dev" ] || continue
-        printf '  %s: ' "$dev"
-        dd if="$dev" bs=512 count=1 2>/dev/null | strings | tr '\n' '|' | head -c 300
+        [ "$dev" = "$OUR_DEV" ] && continue
+        printf '  %s MBR+super: ' "$dev"
+        dd if="$dev" bs=512 count=4 2>/dev/null | strings | tr '\n' '|' | cut -c1-200
         echo
     done
-    echo "## --- raw disk: blkid on all SCSI disks ---"
-    blkid /dev/sd* 2>&1 || true
+    echo "## --- mount non-gitrepo ext4 disks + list root contents ---"
+    for dev in /dev/sda /dev/sdb /dev/sdd /dev/sde /dev/sdf /dev/sdg /dev/sdh /dev/sdi; do
+        [ -b "$dev" ] || continue
+        [ "$dev" = "$OUR_DEV" ] && continue
+        mnt="/tmp/.mnt_${dev##*/}"
+        mkdir -p "$mnt" 2>/dev/null
+        if mount -o ro "$dev" "$mnt" 2>/dev/null; then
+            echo "  === MOUNTED $dev at $mnt ==="
+            ls -la "$mnt/" 2>&1 | head -20
+            echo "  --- du top 5 ---"; du -sh "$mnt"/* 2>/dev/null | sort -rh | head -5
+            umount "$mnt" 2>/dev/null
+        else
+            echo "  $dev: mount failed"
+        fi
+        rmdir "$mnt" 2>/dev/null
+    done
+    echo "## --- vsock probe (CID=2 host, GCS ports) via socat or bash fallback ---"
+    for port in 2056 2057 1024 8000; do
+        if command -v socat >/dev/null 2>&1; then
+            out=$(echo "" | timeout 2 socat - VSOCK-CONNECT:2:"$port" 2>&1 | head -c 100)
+            echo "  vsock cid=2 port=$port socat: ${out:-<no banner>}"
+        else
+            echo "  socat not found; raw fd approach for port=$port"
+            ( exec 5<>/dev/vsock 2>/dev/null && echo "fd_open" || echo "fd_err" ) 2>&1 || true
+        fi
+    done
     echo "## --- route: 10.92.0.0/16 added via eth0 (for deferred TCP probe) ---"
     ip route add 10.92.0.0/16 dev eth0 2>&1 || true
     ip route show 2>&1
@@ -171,22 +198,34 @@ echo "=== PROBE START $(date -u) pid=$$ ===" >> "$OUT"
 ip route add 10.92.0.0/16 dev eth0 2>/dev/null || true
 ip route show >> "$OUT" 2>&1
 
-for target in 10.92.0.13 10.92.0.12 10.92.0.4 10.92.0.6; do
-    for port in 19080 19000 1025 8080 80 443 22 2379 6443 9000; do
-        python3 -c "
-import socket, sys
-target='$target'; port=$port; out='$OUT'
-try:
-    s=socket.socket(); s.settimeout(3); s.connect((target,port))
-    s.send(b'GET / HTTP/1.0\r\nHost: '+target.encode()+b'\r\n\r\n')
-    d=s.recv(512); s.close()
-    msg='OPEN {}:{} {}'.format(target,port,repr(d[:120]))
-except Exception as e:
-    msg='CLOSED {}:{} {}'.format(target,port,str(e)[:60])
-open(out,'a').write(msg+'\n')
-" 2>/dev/null || echo "nopy $target:$port" >> "$OUT"
+# Pure-bash connect-with-timeout: uses FIFO + read -t (bash builtin, no sleep binary)
+PFIFO="$OUT.fifo.$$"
+mkfifo "$PFIFO" 2>/dev/null
+exec 9<>"$PFIFO"
+
+tcp_probe() {
+    local target=$1 port=$2 delay=4
+    (
+        set +e
+        exec 3<>/dev/tcp/"$target"/"$port" 2>/dev/null || { echo "FAIL" >&9; exit 1; }
+        printf 'GET / HTTP/1.0\r\nHost: %s\r\n\r\n' "$target" >&3
+        read -t 2 -u 3 line 2>/dev/null
+        echo "OPEN:${line}" >&9
+        exec 3>&-
+    ) &
+    cpid=$!
+    read -t "$delay" -u 9 res 2>/dev/null
+    kill "$cpid" 2>/dev/null; wait "$cpid" 2>/dev/null
+    echo "${res:-TIMEOUT} ${target}:${port}" >> "$OUT"
+}
+
+for target in 10.92.0.15 10.92.0.13 10.92.0.12 10.92.0.4 10.92.0.6; do
+    for port in 19080 19000 1025 9100 8080 80 443 22 2379 6443 10250; do
+        tcp_probe "$target" "$port"
     done
 done
+
+exec 9>&-; rm -f "$PFIFO"
 echo "=== PROBE DONE $(date -u) ===" >> "$OUT"
 PROBE_EOF
 chmod +x "$PROBE_SH"
